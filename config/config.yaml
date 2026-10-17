@@ -1,0 +1,7 @@
+seed: 3101
+pairs_per_task: 80
+small_gru_epochs: 3
+llm_pairs_per_task: 2
+models:
+  - HuggingFaceTB/SmolLM2-135M-Instruct
+  - HuggingFaceTB/SmolLM2-360M-Instruct

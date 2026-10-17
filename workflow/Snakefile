@@ -1,0 +1,10 @@
+# Optional Snakemake interface; direct Kaggle users should use scripts/run_all_kaggle.py.
+configfile: '../config/config.yaml'
+rule all:
+    input:
+        'histchess_results/run_status.json'
+rule experiments:
+    output:
+        'histchess_results/run_status.json'
+    shell:
+        'python scripts/run_all_kaggle.py --out histchess_results --pairs-per-task {config[pairs_per_task]} --epochs {config[small_gru_epochs]} --llm-pairs-per-task {config[llm_pairs_per_task]} --strict'
