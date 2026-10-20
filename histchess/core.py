@@ -14,8 +14,8 @@ from pathlib import Path
 import chess
 
 TASKS = ("castling", "en_passant", "halfmove", "repetition")
-CAST_POS = ("g1f3", "g8f6", "h1g1", "b8c6", "e2e4", "e7e5", "g1h1", "c6b8", "f3g1", "f6g8")
-CAST_NEG = ("g1f3", "g8f6", "b1c3", "b8c6", "e2e4", "e7e5", "f3g1", "c6b8", "c3b1", "f6g8")
+CAST_POS = ("g1f3", "g8f6", "b1c3", "b8c6", "e2e4", "e7e5", "f3g1", "c6b8", "c3b1", "f6g8")
+CAST_NEG = ("g1f3", "g8f6", "h1g1", "b8c6", "e2e4", "e7e5", "g1h1", "c6b8", "f3g1", "f6g8")
 EP_POS = ("e2e4", "a7a6", "e4e5", "d7d5")
 EP_NEG = ("e2e4", "d7d5", "e4e5", "a7a6")
 HALF_POS = ("e2e4", "e7e5", "g1f3", "g8f6", "f3g1", "f6g8")
@@ -138,8 +138,8 @@ def castling_suffix(rng, aa, bb, length):
             rc = right.copy(stack=True)
             lc.push(move)
             rc.push(move)
-            if (not lc.has_kingside_castling_rights(chess.WHITE)
-                    and rc.has_kingside_castling_rights(chess.WHITE)
+            if (lc.has_kingside_castling_rights(chess.WHITE)
+                    and not rc.has_kingside_castling_rights(chess.WHITE)
                     and board_key(lc) == board_key(rc)):
                 choices.append(move)
         if not choices:

@@ -11,7 +11,7 @@ import random
 import re
 from pathlib import Path
 
-from .core import TASKS, rows_from_pairs, write_jsonl
+from .core import TASKS, rows_from_pairs, write_jsonl, replay, observed_label
 
 
 def write_csv(path, rows):
@@ -62,7 +62,7 @@ def baseline_experiments(pairs, outdir):
         for variant in ("positive", "negative"):
             r = p[variant]
             key = (p["pair_id"], variant)
-            preds["full_history_rule_oracle"][key] = bool(r["label"])
+            preds["full_history_rule_oracle"][key] = observed_label(replay(r["history_uci"]), p["task"])
             # Board-only Bayes baseline on a balanced matched-pair set: 0/1 tie.
             preds["board_only_majority"][key] = False
             fields = r["fen"].split()
@@ -238,60 +238,98 @@ def parse_yes_no(output):
     return None if not m else (m.group(1)=="yes")
 
 
-def llm_experiment(pairs, outdir, models, pairs_per_task=2, seed=3101):
+def llm_experiment(pairs, outdir, models, pairs_per_task=20, seed=3101,
+                   batch_size=8, require_gpu=True, max_new_tokens=6):
+    """Full-history-only prompts, fixed balanced TEST sample, batched CUDA inference.
+
+    The same sampled pair IDs are used for every model. An ambiguous answer
+    remains invalid, and missing predictions count wrong in headline metrics.
+    """
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
-    torch.set_num_threads(min(2,os.cpu_count() or 2))
-    # One shared balanced fixed sample per model. Includes complete paired examples.
-    selected=[]
+
+    if require_gpu and not torch.cuda.is_available():
+        raise RuntimeError("GPU required for LLM evaluations; select Kaggle GPU accelerator")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    selected = []
     for task in TASKS:
-        available=sorted([p for p in pairs if p["split"]=="test" and p["task"]==task],key=lambda p:p["pair_id"])
-        if not available:
-            raise RuntimeError(f"No test pairs for task {task}")
-        rng=random.Random(seed+TASKS.index(task))
-        selected.extend(rng.sample(available,min(pairs_per_task,len(available))))
-    save_json(Path(outdir)/"llm_sample.json", {"pair_ids":[p["pair_id"] for p in selected],"pairs_per_task":pairs_per_task, "seed":seed})
-    qs={
-        "castling":"Does White still retain kingside castling rights (regardless of whether the move can be played immediately)?",
-        "en_passant":"Is there a LEGAL en-passant capture for the side to move right now?",
-        "halfmove":"Is the halfmove clock at least 2?",
-        "repetition":"Has this exact rule-equivalent position already occurred at least three times INCLUDING the current position? Do not count a possible future repetition.",
+        available = sorted((p for p in pairs if p["split"] == "test" and p["task"] == task),
+                           key=lambda p:p["pair_id"])
+        if len(available) < pairs_per_task:
+            raise RuntimeError(f"Only {len(available)} TEST pairs of {task}; require {pairs_per_task}. "
+                               "Raise pairs-per-task or lower llm-pairs-per-task explicitly.")
+        rng = random.Random(seed + TASKS.index(task))
+        selected.extend(rng.sample(available, pairs_per_task))
+    save_json(Path(outdir) / "llm_sample.json",
+              {"pair_ids":[p["pair_id"] for p in selected],
+               "pairs_per_task":pairs_per_task,"seed":seed,
+               "sampling":"balanced matched test pairs only; identical sample per LLM"})
+    questions = {
+        "castling": "Does White still retain kingside castling RIGHTS (not whether castling is immediately legal)?",
+        "en_passant": "Does the side to move have a LEGAL en-passant capture right now?",
+        "halfmove": "Is the current halfmove clock at least 2?",
+        "repetition": "Has the CURRENT rule-equivalent position appeared at least three times INCLUDING now? Do not count future moves.",
     }
-    final=[]
-    records=[]
-    for mid in models:
-        print("Loading LLM (one at a time):",mid,flush=True)
-        tokenizer=AutoTokenizer.from_pretrained(mid)
-        lm=AutoModelForCausalLM.from_pretrained(mid,torch_dtype=torch.float32).to("cpu")
-        lm.eval()
-        model_preds={}
-        for p in selected:
-            for variant in ("positive","negative"):
-                item=p[variant]
-                query=("You are evaluating chess rules. All moves start from the standard initial chess position. "
-                       "Read the WHOLE history; no board-only guesses. Reply with only YES or NO.\n"
-                       f"Question: {qs[p['task']]}\n"
-                       f"Final visible board and side: {item['board_observation']}\n"
-                       f"Chronological moves (UCI): {' '.join(item['history_uci'])}\n"
-                       "Answer:")
-                messages=[{"role":"user","content":query}]
-                if tokenizer.chat_template:
-                    inp=tokenizer.apply_chat_template(messages,add_generation_prompt=True,return_tensors="pt",tokenize=True)
-                else:
-                    inp=tokenizer(query,return_tensors="pt")["input_ids"]
+    requests=[]
+    for p in selected:
+        for variant in ("positive","negative"):
+            item=p[variant]
+            question=("All moves start from the standard chess initial position. "
+                      "Determine the chess rule from the full chronological UCI move history. "
+                      "The observation excludes castling rights, en passant target and clocks. "
+                      "Reply YES or NO only.\n"
+                      f"Question: {questions[p['task']]}\n"
+                      f"Visible final piece placement and side to move: {item['board_observation']}\n"
+                      f"Chronological UCI moves: {' '.join(item['history_uci'])}\nAnswer:")
+            requests.append((p,variant,question))
+    all_metrics, all_records=[] , []
+    for name in models:
+        print(f"GPU LLM loading: {name}",flush=True)
+        tokenizer=AutoTokenizer.from_pretrained(name,trust_remote_code=False)
+        tokenizer.padding_side="left"
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token=tokenizer.eos_token
+        model=AutoModelForCausalLM.from_pretrained(name,torch_dtype=dtype,trust_remote_code=False).to(device)
+        model.eval()
+        pred={}
+        try:
+            for offset in range(0,len(requests),batch_size):
+                batch=requests[offset:offset+batch_size]
+                prompts=[]
+                for _, _, question in batch:
+                    msgs=[{"role":"user","content":question}]
+                    prompt=(tokenizer.apply_chat_template(msgs,tokenize=False,add_generation_prompt=True)
+                            if tokenizer.chat_template else question)
+                    prompts.append(prompt)
+                encoded=tokenizer(prompts,return_tensors="pt",padding=True, truncation=False)
+                # Never silently truncate away the causal history.
+                maximum=getattr(model.config,"max_position_embeddings",None)
+                if maximum and encoded["input_ids"].shape[-1] + max_new_tokens > maximum:
+                    raise RuntimeError(f"Model {name} context exceeded: {encoded['input_ids'].shape[-1]} + {max_new_tokens} > {maximum}")
+                encoded={k:v.to(device) for k,v in encoded.items()}
                 with torch.inference_mode():
-                    generated=lm.generate(inp,max_new_tokens=8,do_sample=False,pad_token_id=tokenizer.eos_token_id)
-                response=tokenizer.decode(generated[0][inp.shape[-1]:],skip_special_tokens=True)
-                pred=parse_yes_no(response)
-                model_preds[(p["pair_id"],variant)]=pred
-                records.append({"model":mid,"pair_id":p["pair_id"],"task":p["task"],"variant":variant,
-                                "expected":item["label"],"prediction":None if pred is None else int(pred),
-                                "valid":pred is not None,"raw_response":response.strip()})
-        for row in metrics(model_preds,[dict(p,split="test") for p in selected],mid):
-            row["evaluation_scope"]="small_diagnostic_sample"
-            final.append(row)
-        del lm,tokenizer
-        gc.collect()
-    write_csv(Path(outdir)/"llm_predictions.csv",records)
-    write_csv(Path(outdir)/"llm_metrics.csv",final)
-    return final
+                    generated=model.generate(**encoded,max_new_tokens=max_new_tokens,
+                                             do_sample=False,
+                                             pad_token_id=tokenizer.pad_token_id)
+                outs=tokenizer.batch_decode(generated[:,encoded["input_ids"].shape[1]:],
+                                             skip_special_tokens=True)
+                for (p,variant,_), raw in zip(batch,outs):
+                    parsed=parse_yes_no(raw)
+                    pred[(p["pair_id"],variant)]=parsed
+                    all_records.append({"model":name,"pair_id":p["pair_id"],"task":p["task"],
+                                        "variant":variant,"label":p[variant]["label"],
+                                        "prediction":"" if parsed is None else int(parsed),
+                                        "valid":parsed is not None,"raw_response":raw.strip()})
+                if offset % max(1, batch_size*12) == 0:
+                    print(f"  {name}: {min(offset+batch_size,len(requests))}/{len(requests)} replies",flush=True)
+            for row in metrics(pred,[dict(p,split="test") for p in selected],name):
+                row["evaluation_scope"]="balanced_fixed_heldout_subset"
+                all_metrics.append(row)
+        finally:
+            del model,tokenizer
+            gc.collect()
+            if device.type == "cuda": torch.cuda.empty_cache()
+    write_csv(Path(outdir) / "llm_predictions.csv",all_records)
+    write_csv(Path(outdir) / "llm_metrics.csv",all_metrics)
+    return all_metrics

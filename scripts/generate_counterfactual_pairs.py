@@ -9,7 +9,7 @@ from histchess.core import generate,validate,write_jsonl
 
 p=argparse.ArgumentParser()
 p.add_argument('--out',default='data/pairs.jsonl')
-p.add_argument('--pairs-per-task',type=int,default=80)
+p.add_argument('--pairs-per-task',type=int,default=300)
 p.add_argument('--seed',type=int,default=3101)
 a=p.parse_args()
 pairs,rejections=generate(a.pairs_per_task,a.seed)

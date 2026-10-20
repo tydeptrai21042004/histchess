@@ -1,10 +1,22 @@
-# Optional Snakemake interface; direct Kaggle users should use scripts/run_all_kaggle.py.
-configfile: '../config/config.yaml'
+# OPTIONAL Snakemake wrapper. The Kaggle one-cell is the primary run path.
+# Invoke from repository root: snakemake -s workflow/Snakefile --cores 1
+configfile: "config/config.yaml"
+
 rule all:
     input:
-        'histchess_results/run_status.json'
-rule experiments:
+        "histchess_results/run_status.json",
+        "histchess_results/final_output_audit.json",
+        "histchess_results/paper_tables.tex",
+
+rule run_full_gpu:
     output:
-        'histchess_results/run_status.json'
+        "histchess_results/run_status.json",
+        "histchess_results/final_output_audit.json",
+        "histchess_results/paper_tables.tex",
     shell:
-        'python scripts/run_all_kaggle.py --out histchess_results --pairs-per-task {config[pairs_per_task]} --epochs {config[small_gru_epochs]} --llm-pairs-per-task {config[llm_pairs_per_task]} --strict'
+        "python scripts/run_all_kaggle.py --out histchess_results "
+        "--pairs-per-task {config[pairs_per_task]} "
+        "--train-seeds {config[training_seeds]} "
+        "--epochs {config[gru_epochs_max]} "
+        "--patience {config[gru_early_stopping_patience]} "
+        "--llm-pairs-per-task {config[llm_pairs_per_task]}"

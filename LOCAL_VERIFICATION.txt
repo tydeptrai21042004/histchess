@@ -1,0 +1,18 @@
+HistChess verified source package | 2026-10-20
+
+Executed in the artifact-build environment:
+  - 7 pytest source/ZIP tests PASSED.
+  - Every .py module AST parsed successfully.
+  - `compileall` succeeded.
+  - Pure functions were exercised: move encoding, history truncation, yes/no
+    parsing and deterministic pair-level bootstrap (record=0.85, pair=0.7
+    on a small artificial fixture). These fixture values are NOT study results.
+  - The delivered ZIP was CRC checked after creation.
+
+NOT executable in this environment:
+  - `python-chess` replay tests, as that library is unavailable locally
+    and outbound pip downloads fail in this environment.
+  - CUDA and true HuggingFace inference: no CUDA device or model packages here.
+
+The Kaggle bootstrap must run the missing real tests and abort with diagnostic
+logs if any fail. Full paper status remains UNVERIFIED until Kaggle finishes.
