@@ -192,7 +192,20 @@ def pair_from_moves(task, pos, neg):
     }
 
 
-def generate(count_per_task=80, seed=3101, max_attempt_multiplier=100):
+def generate(count_per_task=80, seed=3101, max_attempt_multiplier=100,
+             generator="legacy", split_strategy="board"):
+    """Construct verified history pairs.
+
+    ``legacy`` exactly retains the original 2026 release behavior. ``diverse``
+    supplies three independently defined generation families per chess rule.
+    """
+    if generator == "diverse":
+        from .diverse import generate_diverse
+        return generate_diverse(count_per_task=count_per_task, seed=seed,
+                                max_attempt_multiplier=max(250, max_attempt_multiplier),
+                                split_strategy=split_strategy)
+    if generator != "legacy" or split_strategy != "board":
+        raise ValueError("legacy supports only board splits; use generator=diverse for family splits")
     rng = random.Random(seed)
     result = []
     used = set()
@@ -249,6 +262,7 @@ def rows_from_pairs(pairs):
                 "split": pair["split"],
                 "variant": variant,
                 "board_key": pair["board_key"],
+                "generator_family": pair.get("generator_family", "legacy"),
                 "history_uci": item["history_uci"],
                 "fen": item["fen"],
                 "label": int(item["label"]),

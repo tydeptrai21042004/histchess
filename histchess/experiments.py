@@ -87,8 +87,13 @@ def leakage_audit(pairs):
     hseq = collections.defaultdict(set)
     fen = collections.defaultdict(set)
     prefix = collections.defaultdict(set)
+    families = collections.defaultdict(set)
+    family_counts = collections.Counter()
     for p in pairs:
         split = p["split"]
+        fam = (p["task"],p.get("generator_family","legacy"))
+        families[fam].add(split)
+        family_counts[(p["task"],p.get("generator_family","legacy"),split)] += 1
         groups[p["board_key"]].add(split)
         for variant in ("positive", "negative"):
             item = p[variant]
@@ -100,12 +105,17 @@ def leakage_audit(pairs):
         "full_history_leakage_count": sum(len(x)>1 for x in hseq.values()),
         "full_FEN_across_split_count": sum(len(x)>1 for x in fen.values()),
         "four_ply_prefix_across_split_count": sum(len(x)>1 for x in prefix.values()),
+        "generator_family_across_split_count": sum(len(x)>1 for x in families.values()),
+        "generator_families": len(families),
+        "generator_family_split_counts": [
+            {"task":t,"family":f,"split":s,"pairs":n}
+            for (t,f,s),n in sorted(family_counts.items())],
         "unique_board_groups": len(groups),
         "unique_full_histories": len(hseq),
         "notes": [
             "Splits are group-disjoint by observable board and hence canonical full FEN.",
             "The prefix overlap statistic warns about shared synthetic templates; it is not proof of memorization.",
-            "All pairs are generated from a few rule mechanisms, so this is not a game-independent split.",
+            "The family holdout tests unseen implemented mechanisms but not independent real-game sources.",
         ],
     }
 

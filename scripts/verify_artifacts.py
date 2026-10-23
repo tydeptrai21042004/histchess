@@ -47,6 +47,13 @@ def verify(archive,require_complete=True):
                 raise ValueError('Experiment incomplete: run_status.json says not complete')
             if manifest.get('status')!='COMPLETE' or not manifest.get('paper_complete'):
                 raise ValueError('Experiment incomplete: manifest.json says not complete')
+        if manifest.get('version','').endswith('v3'):
+            new_files={'shortcut_metrics.csv','shortcut_predictions.csv','shortcut_audit.json'}
+            if missing_new := (new_files - names):
+                raise ValueError(f'Missing strengthened benchmark artifacts: {sorted(missing_new)}')
+            leak=load('leakage_audit.json')
+            if status.get('parameters',{}).get('split_strategy')=='family' and leak.get('generator_family_across_split_count'):
+                raise ValueError('Family holdout contains train/test mechanism overlap')
         source_hash=hashlib.sha256(z.read(root+'/data/pairs.jsonl')).hexdigest()
         if source_hash!=manifest.get('pairs_sha256'):
             raise ValueError('SHA256 mismatch for pairs.jsonl')

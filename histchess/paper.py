@@ -72,6 +72,8 @@ def prediction_collections(pairs, outdir):
         grouped[(f"GRU_history_{r['history_moves']}",r["seed"])][(r["pair_id"],r["variant"])]=int(r["prediction"])==1
     for r in read_csv(outdir/"llm_predictions.csv"):
         grouped[(r["model"],"llm")][(r["pair_id"],r["variant"])]=(None if not r["valid"].lower()=="true" else int(r["prediction"])==1)
+    for r in read_csv(outdir/"shortcut_predictions.csv"):
+        grouped[(r["model"],"fixed" if r["model"]=="legacy_fixed_signatures" else "train_fitted")][(r["pair_id"],r["variant"])]=int(r["prediction"])==1
     return grouped
 
 
@@ -219,6 +221,19 @@ def paper_tables(outdir, *, sample_note=""):
             lines.append(f"| {r['model']} | {r['task']} | {r['test_pairs']} | "
                          f"{float(r['accuracy_including_invalid']):.3f} | "
                          f"{float(r['paired_joint_accuracy']):.3f} | {r['invalid_or_missing']} |")
+    if (outdir/"shortcut_metrics.csv").exists():
+        lines.extend(["", "## Shortcut probes (history-only; same held-out test pairs)",
+                      "", "Simple signatures are diagnostic comparators, not an oracle.",
+                      "High accuracy here weakens claims about learned generalizable reasoning.", "",
+                      "| Probe | Test pairs | Record accuracy | Joint-pair accuracy | Train signature coverage |",
+                      "|---|---:|---:|---:|---:|"])
+        for sr in read_csv(outdir/"shortcut_metrics.csv"):
+            if sr["task"] != "all":
+                continue
+            lines.append(f"| {sr['model']} | {sr['test_pairs']} | "
+                         f"{float(sr['accuracy_including_invalid']):.3f} | "
+                         f"{float(sr['paired_joint_accuracy']):.3f} | "
+                         f"{float(sr['train_signature_coverage']):.3f} |")
     (outdir/"paper_tables.md").write_text("\n".join(lines)+"\n",encoding="utf8")
     # A small compilable input-only tabular fragment; no fabricated numbers.
     latex=["% Auto-generated; include with \\input{paper_tables.tex}",

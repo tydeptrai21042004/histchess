@@ -27,6 +27,7 @@ from histchess.experiments import baseline_experiments, leakage_audit, llm_exper
 from histchess.gpu_experiments import history_experiment
 from histchess.paper import paper_statistics, paper_tables, make_figures
 from histchess.audit import audit_final_predictions
+from histchess.shortcuts import shortcut_experiments
 
 
 def main():
@@ -42,12 +43,20 @@ def main():
     ap.add_argument('--llm-pairs-per-task',type=int,default=20)
     ap.add_argument('--bootstrap',type=int,default=2000)
     ap.add_argument('--max-history',type=int,default=128)
+    ap.add_argument('--generator',choices=('diverse','legacy'),default='diverse',
+                    help='diverse = 3 mechanism families per task; legacy = original release')
+    ap.add_argument('--split-strategy',choices=('family','board'),default=None,
+                    help='family holds out entire mechanisms; board holds out positions only')
     ap.add_argument('--models',nargs='+',default=['HuggingFaceTB/SmolLM2-135M-Instruct',
                                                 'HuggingFaceTB/SmolLM2-360M-Instruct'])
     ap.add_argument('--smoke',action='store_true',help='Fast sanity run only. Not paper complete.')
     ap.add_argument('--skip-llm',action='store_true',help='Skip pretrained comparisons; NOT full paper.')
     ap.add_argument('--allow-cpu',action='store_true',help='Only for local debugging; full Kaggle mode requires GPU.')
     args=ap.parse_args()
+    if args.split_strategy is None:
+        args.split_strategy = 'family' if args.generator == 'diverse' else 'board'
+    if args.generator == 'legacy' and args.split_strategy != 'board':
+        ap.error('Legacy generator has no independent families; use --split-strategy board')
     if args.smoke:
         args.pairs_per_task=40
         args.epochs=2
@@ -87,7 +96,8 @@ def main():
             print(traceback.format_exc(),flush=True)
             raise
     required=['environment_preflight','dataset_generation','independent_replay_validation',
-              'board_FEN_and_oracle_controls','leakage_audit','gpu_train_and_retrained_history_ablations',
+              'board_FEN_and_oracle_controls','leakage_audit','shortcut_baselines',
+              'gpu_train_and_retrained_history_ablations',
               'pretrained_llm_comparison','paired_statistical_analysis','paper_tables_and_figures','final_output_integrity_audit']
     try:
         def preflight():
@@ -105,7 +115,9 @@ def main():
             random.seed(args.seed)
             return True
         step('environment_preflight',preflight)
-        pairs,rejections=step('dataset_generation',lambda:generate(args.pairs_per_task,args.seed))
+        pairs,rejections=step('dataset_generation',lambda:generate(
+            args.pairs_per_task,args.seed,generator=args.generator,
+            split_strategy=args.split_strategy))
         write_jsonl(out/'data'/'pairs.jsonl',pairs)
         save_json(out/'data'/'generation_rejections.json',rejections)
         validation=step('independent_replay_validation',lambda:validate(pairs))
@@ -123,6 +135,9 @@ def main():
         bad=[k for k in ('board_group_leakage_count','full_history_leakage_count',
                         'full_FEN_across_split_count') if audit[k]]
         if bad: raise RuntimeError(f'Cross-split leakage detected: {bad}')
+        if args.split_strategy == 'family' and audit['generator_family_across_split_count']:
+            raise RuntimeError('Generator family leakage across splits')
+        step('shortcut_baselines',lambda:shortcut_experiments(pairs,out))
         seeds=[args.seed+i for i in range(args.train_seeds)]
         step('gpu_train_and_retrained_history_ablations', lambda:history_experiment(
             pairs,out,seeds=seeds,cutoffs=(0,4,8,16,32,None),epochs=args.epochs,
@@ -146,7 +161,11 @@ def main():
                                 for x in required)
         # 'completed' means the code ran; these tests do NOT establish the
         # validity of generalization claims or reproduce an unseen manuscript.
+        # Compatibility with the existing artifact verifier: means only that
+        # this repository's requested stages completed, NOT journal readiness.
         status['paper_complete']=status['completed'] and not args.smoke
+        status['claim_scope']='synthetic_generator_family_holdout' if args.split_strategy=='family' else 'synthetic_board_group_holdout'
+        status['submission_ready_assessed']=False
         return 0 if (status['completed'] or args.smoke or args.skip_llm) else 1
     except Exception:
         return 1
@@ -156,16 +175,16 @@ def main():
         save_json(out/'run_status.json',status)
         data_path=out/'data'/'pairs.jsonl'
         save_json(out/'manifest.json',{
-            'version':'HistChess GPU pipeline v2',
+            'version':'HistChess diversified synthetic pipeline v3',
             'status':'COMPLETE' if status['completed'] else 'INCOMPLETE',
             'gpu':gpu,'parameters':vars(args),
             'pairs_sha256':hashlib.sha256(data_path.read_bytes()).hexdigest() if data_path.exists() else None,
             'paper_complete':status['paper_complete'],
-            'limitations':['Generated pairs use a few synthetic rule mechanisms.',
-                           'Observable-board group disjointness does not prove opening/template independence.',
+            'limitations':['All samples remain synthetic and must not be described as independent real games.',
+                           'Generator-family holdout tests three defined families per task, not general chess understanding.',
                            'LLMs are evaluated on a fixed subset, not necessarily the full GRU test set.',
                            'Full FEN is privileged information and is not a fair history-only comparator.',
-                           'No original manuscript was supplied; actual paper requirements may be broader.']})
+                           'Successful execution does not certify journal readiness.']})
         archive=out.parent/(out.name+'.zip')
         with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
             for path in sorted(out.rglob('*')):

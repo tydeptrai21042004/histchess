@@ -72,6 +72,7 @@ def audit_final_predictions(pairs,outdir,seeds,cutoffs,llm_models=None,llm_pairs
         llm_details={'models':len(llm_models),'sampled_test_pairs':len(sample_ids),
                      'evaluated_records':len(llm)}
     for filename in ('validation.json','leakage_audit.json','baseline_metrics.csv',
+                     'shortcut_metrics.csv','shortcut_predictions.csv','shortcut_audit.json',
                      'gru_learning_curve.csv','history_ablation.csv',
                      'paired_confidence_intervals.csv','paired_significance.csv',
                      'paper_tables.md','paper_tables.tex','history_gru_best.pt'):
