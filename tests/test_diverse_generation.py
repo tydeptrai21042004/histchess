@@ -41,7 +41,16 @@ def test_original_signatures_not_perfect_on_diversified_family_test(tmp_path):
 
 def test_family_split_disjointness_and_per_task_balance_larger():
     pairs,_=generate(60,seed=3101,generator='diverse',split_strategy='family')
-    assert validate(pairs)['passed']
+    report = validate(pairs)
+    assert report['passed'], report['errors']
+    # No position may appear in different task families, even if the tasks
+    # have different classification labels or train/validation/test splits.
+    boards = [p['board_key'] for p in pairs]
+    assert len(set(boards)) == len(boards)
+    audit = leakage_audit(pairs)
+    assert audit['board_group_leakage_count'] == 0
+    assert audit['full_FEN_across_split_count'] == 0
+    assert audit['generator_family_across_split_count'] == 0
     for task in TASKS:
         assert collections.Counter(p['split'] for p in pairs if p['task']==task)=={
             'train':20,'validation':20,'test':20}

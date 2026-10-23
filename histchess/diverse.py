@@ -182,7 +182,12 @@ def generate_diverse(count_per_task=80, seed=3101,
                 try:
                     pos, neg = functions[task](rng, family)
                     pair = pair_from_moves(task, pos, neg)
-                    novelty = (task, pair["board_key"])
+                    # A board can appear under multiple chess tasks. Validation
+                    # requires observable boards to be disjoint across *all*
+                    # task/split combinations, not just within each task.
+                    # Enforce that invariant at generation time so a family
+                    # held out for one task cannot leak through another task.
+                    novelty = pair["board_key"]
                     if novelty in used:
                         failures[f"{task}:{family}:duplicate_board"] += 1
                         continue

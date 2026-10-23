@@ -1,34 +1,25 @@
-# HistChess v3 — strengthened synthetic benchmark patch
+# HistChess v3 — generator-family split validation fix
 
-**Scope.** This ZIP includes only new and modified code plus patch instructions. It does **not** contain newly computed scientific results. Apply at the root of `tydeptrai21042004/histchess`, keeping directory structure. Commit and push before running the Kaggle cell.
+## Observed failure
+Kaggle commit `41c51f62bdfea95a1574b728e5c46e9a68bb524d`:
+`tests/test_diverse_generation.py::test_family_split_disjointness_and_per_task_balance_larger`
+failed at `assert validate(pairs)["passed"]` (56 tests passed, 1 failed).
 
-## Changes
+## Root cause and fix
+The diversified generator tracked uniqueness by `(task, board_key)`, allowing the
+same observable chess board to be assigned to different generator-family splits
+across different tasks. `validate()` correctly prohibits that cross-split board
+leakage. The generator now tracks `board_key` **globally** across all tasks,
+resampling colliding candidates while retaining the same rule oracle, family
+assignments and target counts. Regression assertions check global board uniqueness.
 
-- New `histchess/diverse.py`: **3 generation mechanisms for each of 4 rule tasks**, each independently passed through legal-move replay and same-board/FEN controls. Legacy generator remains fully available.
-- New **mechanism-held-out** split (`--generator diverse --split-strategy family`): complete generation families withheld from training/validation; every task has train, validation, and test pairs.
-- New `histchess/shortcuts.py`: records legacy fixed-rule shortcut performance and prefix/suffix n-gram memorization classifiers trained **on train only**, scored on held-out test only. Raw predictions and signature coverage exported.
-- Expanded `leakage_audit.json`: per-task family/split counts and cross-split family overlap.
-- Paired bootstrap confidence intervals and automatically generated `paper_tables.md` now include shortcut models; no fabricated numbers.
-- Fail-closed full pipeline audit and artifact checks for the new reports.
-- `tests/test_diverse_generation.py` tests deterministic replay, family-level holdout, non-perfect original signatures and compatibility with the old generator.
-- `KAGGLE_CPU_STRENGTHENED_ONE_CELL.py` starts from GitHub clone and produces separate v3 result + dataset + diagnostics archives.
+## Usage
+1. To permanently update GitHub, extract this archive into the root of the
+   strengthened `histchess` repository, preserving directory paths; commit and push.
+2. To run immediately, execute `KAGGLE_CPU_V3_FIXED_ONE_CELL.py` in a Kaggle notebook
+   (Accelerator=None, Internet=On). That cell clones GitHub and automatically
+   applies this precise fix if the previous version is still committed.
 
-## Run (Kaggle, CPU, Internet ON)
-
-After uploading these files to GitHub, copy the contents of `KAGGLE_CPU_STRENGTHENED_ONE_CELL.py` into **one** Kaggle cell. Select **Accelerator=None**. The cell runs unit/integration tests, stress cases, smoke, the complete GRU/LLM pipeline, validation and ZIP verification. It preserves partial outputs on error.
-
-Or run locally:
-
-```bash
-pip install -r requirements.txt
-python -m pytest -q tests -m 'not gpu_integration'
-python scripts/stress_test.py --generator diverse --split-strategy family --pairs-per-task 60
-python scripts/run_all_kaggle.py --out histchess_results_v3 --allow-cpu --generator diverse --split-strategy family --pairs-per-task 300 --epochs 14 --train-seeds 2 --llm-pairs-per-task 24
-python scripts/verify_artifacts.py histchess_results_v3.zip
-```
-
-## Required paper wording / limitations
-
-This remains a **synthetic** counterfactual dataset, with **three defined recipe families per task**. Family holdout evaluates **inter-mechanism transfer** only; it is not equivalent to unseen natural games, independent labeling rules engines, new LLMs, or true out-of-distribution chess generalization. Keep the original scores as **v2 in-distribution** results; never merge v2 and v3 prediction CSVs, since the data and test distributions differ. Report task-wise accuracy and paired joint accuracy, held-out family names, nonparametric paired CIs, the prefix/suffix shortcut coverage, and exact tested Git SHA.
-
-The `paper_complete` field in the legacy output contract means that the **configured code stages ran**; it is not a claim that manuscript peer-review requirements are fulfilled. Newly generated results are only valid when all new chess-rule tests, `validation.json`, `leakage_audit.json`, `shortcut_audit.json`, and artifact verification pass on the actual Kaggle execution.
+The fix has passed Python syntax checks and ZIP CRC verification locally.
+The end-to-end chess replay tests must run in Kaggle; this sandbox does not have
+`python-chess` installed and cannot download it. No model accuracy claim is made.
