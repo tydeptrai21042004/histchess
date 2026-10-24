@@ -1,6 +1,6 @@
-# HistChess v4 research benchmark -- one CPU-only Kaggle cell.
+# HistChess v4.1 research benchmark -- one CPU-only Kaggle cell.
 # Kaggle settings: Accelerator=None, Internet=On.
-# Upload HistChess_v4_code_patch.zip as input, OR push the contents of that ZIP
+# Upload HistChess_v4_1_code_patch.zip as input, OR push the contents of that ZIP
 # (preserving paths) into https://github.com/tydeptrai21042004/histchess.
 # Input archive from v3 is never resumed into v4; the new fingerprint forbids it.
 import hashlib, json, os, shutil, subprocess, sys, traceback, zipfile
@@ -22,7 +22,7 @@ CFG=PROFILES[PROFILE]
 WORK=Path('/kaggle/working')
 assert WORK.is_dir(), 'Run this cell in Kaggle.'
 REPO=WORK/'histchess'
-NAME=f'histchess_architecture_v4_{PROFILE}_long{LONG_TARGET}'
+NAME=f'histchess_architecture_v4_1_{PROFILE}_long{LONG_TARGET}'
 OUT=WORK/NAME
 LOGS=WORK/(NAME+'_diagnostics')
 LOGS.mkdir(parents=True,exist_ok=True)
@@ -71,8 +71,9 @@ def package(folder,destination):
 
 
 def attach_patch():
-    patches=sorted(Path('/kaggle/input').rglob('HistChess_v4_code_patch.zip'))
+    patches=sorted(Path('/kaggle/input').rglob('HistChess_v4_1_code_patch.zip'))
     if not patches:
+        print('No v4.1 ZIP attached: using committed GitHub source.',flush=True)
         return 'GitHub source used (no patch attached)'
     p=patches[0]
     count=unzip_safe(p,REPO)
@@ -107,8 +108,10 @@ try:
     execute('01_clone',['git','clone','--depth','1',REPO_URL,REPO],WORK)
     patch_sha=attach_patch()
     source=(REPO/'histchess/architecture_benchmark.py').read_text(encoding='utf8')
-    if 'histchess-v4-evaluation-2026-10' not in source or not (REPO/'histchess/length_stress.py').exists():
-        raise RuntimeError('Repository is not HistChess v4. Push the patch files or attach HistChess_v4_code_patch.zip.')
+    if ('histchess-v4-evaluation-2026-10' not in source or
+        'synthetic_common_castling_continuation_v2' not in
+        (REPO/'histchess/length_stress.py').read_text(encoding='utf8')):
+        raise RuntimeError('HistChess v4.1 fix missing. Commit the corrected patch or attach HistChess_v4_1_code_patch.zip. Do not use the old v4 ZIP.')
     sha=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip()
     (LOGS/'source.json').write_text(json.dumps({'git_sha':sha,'patch_sha':patch_sha,'profile':PROFILE,
         'long_target_plies':LONG_TARGET,'config':CFG},indent=2),encoding='utf8')
@@ -116,8 +119,8 @@ try:
                                 'chess==1.11.2','pytest>=7,<10'],WORK)
     import torch
     if torch.cuda.is_available():raise RuntimeError('Use CPU-only Kaggle setting (Accelerator=None).')
-    execute('03_tests',[sys.executable,'-m','pytest','-q',
-                        'tests/test_architecture_benchmark.py','-m','not gpu_integration'])
+    execute('03_tests_including_long_history',[sys.executable,'-m','pytest','-q',
+                        'tests/test_architecture_benchmark.py','tests/test_length_stress.py','-m','not gpu_integration'])
     cmd=[sys.executable,'scripts/run_architecture_benchmark.py','--out',OUT,
          '--architectures',*CFG['models'],'--folds',*CFG['folds'],'--seeds',*CFG['seeds'],
          '--cutoffs',*CFG['cutoffs'],'--epochs',CFG['epochs'],'--patience',7,
@@ -136,7 +139,7 @@ try:
     expected=len(CFG['models'])*len(CFG['folds'])*len(CFG['seeds'])*len(CFG['cutoffs'])
     if not status['complete'] or len(status['runs'])!=expected:
         raise RuntimeError(f'Incomplete experiment: expected {expected} runs')
-    print('\nCOMPLETE:',expected,'HistChess v4 runs audited.',flush=True)
+    print('\nCOMPLETE:',expected,'HistChess v4.1 runs audited.',flush=True)
 except BaseException:
     (LOGS/'failure.txt').write_text(traceback.format_exc(),encoding='utf8')
     print('FAILED; valid completed shards remain available for resume.',flush=True)

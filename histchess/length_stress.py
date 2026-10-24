@@ -1,134 +1,252 @@
-"""OPTIONAL synthetic neutral-history stress test for the v3 counterfactual pairs.
+"""Certified synthetic long-history stress data for HistChess.
 
-Not a corpus of realistic chess games. For castling, a common reversible
-knight excursion follows the event that removed the right; for other tasks the
-excursion precedes the decisive suffix (so long input != long dependency).
-Every completed history is re-played with python-chess and compared against
-its original hidden-state label by core.pair_from_moves.
+This is NOT a real-game benchmark.  Castling rights have a long causal delay:
+we append a common legal continuation after the divergent event.  For the
+other rule tasks, a synthetic common prefix precedes the decisive task suffix,
+so input length must not be conflated with causal-memory distance.
 
-The generator rejects sequences reaching an automatic game outcome, including
-fivefold repetition and the 75-move rule. Failure to produce the requested
-length is fatal: it never silently keeps a shorter pair.
+All returned histories are checked by ``pair_from_moves`` and replayed move by
+move against python-chess, including automatic game outcomes.  No failures are
+silently skipped or replaced with shorter inputs.
 """
 from __future__ import annotations
 
-import math
 import random
-
 import chess
 
-from .core import replay, pair_from_moves, board_key
+from .core import board_key, observed_label, pair_from_moves, replay
 
 
 def _automatic_outcome(board):
     return board.outcome(claim_draw=False) is not None
 
 
-def _tour(start_a, start_b, moves_required, rng):
-    """A synchronized, reversible, knight-only walk of 4n plies.
+def _verify_trajectory(history):
+    board=chess.Board()
+    for ply, uci in enumerate(history, 1):
+        move=chess.Move.from_uci(uci)
+        if move not in board.legal_moves:
+            raise ValueError(f"Illegal move at ply {ply}: {uci}")
+        board.push(move)
+        if _automatic_outcome(board):
+            raise ValueError(f"Automatic game outcome at ply {ply}")
+    return board
 
-    Both positions must have identical layout and turn. Knight-only moves are
-    never captures, promotions, or pawn moves. A forward path is inverted in
-    side-to-move order; all moves and automatic game termination are checked.
+
+def _common_castling_suffix(pos, neg, missing, rng):
+    """Quiet, shared continuation, keeping WHITE kingside rights different.
+
+    Unlike a reversible knight-only tour, this works even when there are no
+    knight moves and uses irreversible pawn advances to avoid fivefold draws.
+    It does not require the board to return to the initial layout: both sides
+    of the *counterfactual pair* receive exactly the same continuation.
     """
-    if moves_required < 0 or moves_required % 4:
-        raise ValueError("Tour length must be a nonnegative multiple of 4")
-    if board_key(start_a) != board_key(start_b):
-        raise ValueError("Tour requires identical observable positions")
-    if not moves_required:
-        return ()
-    left=start_a.copy(stack=True);right=start_b.copy(stack=True)
-    start_key=(left.board_fen(), left.turn)
-    forward=[]
-    for _ in range(moves_required//2):
-        available=[]
-        for mv in left.legal_moves:
-            if (left.piece_type_at(mv.from_square)==chess.KNIGHT
-                    and mv in right.legal_moves and not left.is_capture(mv)
-                    and not right.is_capture(mv)):
-                available.append(mv)
-        if not available:raise ValueError("No reversible knight move available")
-        rng.shuffle(available)
-        chosen=None
-        for mv in available:
-            left.push(mv);right.push(mv)
-            if not _automatic_outcome(left) and not _automatic_outcome(right):
-                chosen=mv;break
-            left.pop();right.pop()
-        if chosen is None:raise ValueError("Forward tour would end the game")
-        forward.append(chosen)
-    # Undo each two-ply white/black pair, preserving the turn order.
-    inverse=[]
-    for ix in range(len(forward)-2,-1,-2):
-        for mv in (forward[ix],forward[ix+1]):
-            inv=chess.Move(mv.to_square,mv.from_square)
-            if (inv not in left.legal_moves or inv not in right.legal_moves
-                    or left.is_capture(inv) or right.is_capture(inv)):
-                raise ValueError("Inverse knight move is not legal")
-            left.push(inv);right.push(inv)
-            if _automatic_outcome(left) or _automatic_outcome(right):
-                raise ValueError("Inverse tour would end the game")
-            inverse.append(inv)
-    if (left.board_fen(),left.turn)!=start_key or (right.board_fen(),right.turn)!=start_key:
-        raise ValueError("Neutral tour failed to restore original board")
-    return tuple(m.uci() for m in forward+inverse)
+    a,b=replay(pos),replay(neg)
+    if board_key(a)!=board_key(b):
+        raise ValueError("Castling starting layouts differ")
+    if not (observed_label(a,"castling") and not observed_label(b,"castling")):
+        raise ValueError("Starting castling labels are invalid")
+    suffix=[]
+    for _ in range(missing):
+        alternatives=[]
+        # Shared legal moves are essential: rights can affect legal castling.
+        right_legal=set(b.legal_moves)
+        for move in a.legal_moves:
+            if move not in right_legal or a.is_capture(move) or b.is_capture(move):
+                continue
+            if move.promotion or a.is_castling(move) or b.is_castling(move):
+                continue
+            piece=a.piece_type_at(move.from_square)
+            if piece == chess.KING:
+                continue
+            # Avoid forcing king/rook rights changes, even on the negative side.
+            if piece == chess.ROOK and a.turn == chess.WHITE:
+                continue
+            a.push(move);b.push(move)
+            valid=(board_key(a)==board_key(b)
+                   and observed_label(a,"castling")
+                   and not observed_label(b,"castling")
+                   and not _automatic_outcome(a) and not _automatic_outcome(b))
+            a.pop();b.pop()
+            if valid:
+                # Pawn pushes and simple piece moves are less likely to trap
+                # the random continuation than queen/rook excursions.
+                priority={chess.PAWN:5,chess.KNIGHT:5,chess.BISHOP:3,
+                          chess.QUEEN:1,chess.ROOK:1}.get(piece,1)
+                alternatives.extend([move]*priority)
+        if not alternatives:
+            raise ValueError(f"No safe shared castling continuation at {len(suffix)} plies")
+        move=rng.choice(alternatives)
+        a.push(move);b.push(move)
+        suffix.append(move.uci())
+    return tuple(suffix)
 
 
-def extend_pair(pair, target_plies=64, seed=3101, attempts=100):
-    if target_plies < 0 or attempts < 1:raise ValueError("Invalid stress settings")
+def _pawn_start_squares_used_by_suffix(pos, neg):
+    """Reserve pawns that the decisive suffix may need at their start square."""
+    reserved=set()
+    start=chess.Board()
+    for uci in pos+neg:
+        source=uci[:2]
+        sq=chess.parse_square(source)
+        if start.piece_type_at(sq)==chess.PAWN:
+            reserved.add(sq)
+    return reserved
+
+
+def _quiet_pawn_pair(board, reserved, pos, neg, prefix, rng):
+    """A two-ply irreversible block that leaves both target suffixes legal."""
+    candidates=[]
+    for white in list(board.legal_moves):
+        if (board.piece_type_at(white.from_square)!=chess.PAWN
+                or white.from_square in reserved or board.is_capture(white)
+                or white.promotion):
+            continue
+        board.push(white)
+        if not _automatic_outcome(board):
+            for black in list(board.legal_moves):
+                if (board.piece_type_at(black.from_square)!=chess.PAWN
+                        or black.from_square in reserved or board.is_capture(black)
+                        or black.promotion):
+                    continue
+                board.push(black)
+                if not _automatic_outcome(board):
+                    trial=prefix+(white.uci(),black.uci())
+                    try:
+                        # The suffix can depend on empty knight destinations,
+                        # specific unmoved pawns, en-passant and repetition.
+                        # Checking both sides before committing is necessary.
+                        replay(trial+pos)
+                        replay(trial+neg)
+                        candidates.append((white,black))
+                    except ValueError:
+                        pass
+                board.pop()
+        board.pop()
+    if not candidates:
+        raise ValueError("No suffix-compatible irreversible pawn block available")
+    white,black=rng.choice(candidates)
+    board.push(white);board.push(black)
+    return (white.uci(),black.uci())
+
+
+def _knight_cycle(board,rng):
+    """Four legal plies: white knight, black knight, then both return."""
+    choices=[]
+    for wm in list(board.legal_moves):
+        if board.piece_type_at(wm.from_square)!=chess.KNIGHT or board.is_capture(wm):
+            continue
+        board.push(wm)
+        for bm in list(board.legal_moves):
+            if board.piece_type_at(bm.from_square)!=chess.KNIGHT or board.is_capture(bm):
+                continue
+            board.push(bm)
+            wi=chess.Move(wm.to_square,wm.from_square)
+            if wi in board.legal_moves and not board.is_capture(wi):
+                board.push(wi)
+                bi=chess.Move(bm.to_square,bm.from_square)
+                if bi in board.legal_moves and not board.is_capture(bi):
+                    board.push(bi)
+                    if not _automatic_outcome(board):
+                        choices.append((wm,bm,wi,bi))
+                    board.pop()
+                board.pop()
+            board.pop()
+        board.pop()
+    if not choices:
+        raise ValueError("No safe four-ply knight cycle")
+    selected=rng.choice(choices)
+    for move in selected:
+        board.push(move)
+    return tuple(move.uci() for move in selected)
+
+
+def _common_prefix(pos,neg,minimum,rng,task):
+    """Bounded 4-ply knight cycles interleaved with 2-ply pawn changes.
+
+    Every two completed knight cycles require a pawn block, preventing the
+    start position of each cycle from recurring five times.  Before the
+    repetition task suffix, a fresh pawn block is mandatory, so the suffix
+    starts from a new position whose earlier occurrences cannot leak labels.
+    """
+    board=chess.Board()
+    prefix=()
+    cycles_since_pawn=0
+    reserved=_pawn_start_squares_used_by_suffix(pos,neg)
+    while len(prefix)<minimum or (task=="repetition" and cycles_since_pawn!=0):
+        # For repetition, leave space for a final irreversible move pair.
+        pawn_required=(cycles_since_pawn>=2 or
+                       (task=="repetition" and len(prefix)>=minimum))
+        if not pawn_required:
+            try:
+                cycle=_knight_cycle(board,rng)
+                prefix+=cycle
+                cycles_since_pawn+=1
+                continue
+            except ValueError:
+                pawn_required=True
+        if pawn_required:
+            block=_quiet_pawn_pair(board,reserved,pos,neg,prefix,rng)
+            prefix+=block
+            cycles_since_pawn=0
+        if len(prefix)>minimum+20:
+            raise ValueError("Prefix exceeded bounded target overshoot")
+    if len(prefix)%2:
+        raise AssertionError("Prefix changed side to move")
+    return prefix
+
+
+def extend_pair(pair,target_plies=64,seed=3101,attempts=100):
+    if target_plies<0 or attempts<1:
+        raise ValueError("Invalid stress settings")
     task=pair["task"]
     pos=tuple(pair["positive"]["history_uci"])
     neg=tuple(pair["negative"]["history_uci"])
-    if len(pos)!=len(neg):raise ValueError("Unequal counterfactual lengths")
-    # In repetition, introduce two different irreversible pawn changes to
-    # ensure that the negative example's final state is encountered only twice.
-    # Neither e/d pawn move blocks the existing knight-template landing squares.
-    pre=("e2e3","e7e6") if task=="repetition" else ()
-    post=("d2d3","d7d6") if task=="repetition" else ()
-    requested_extra=max(0,target_plies-len(pos)-len(pre)-len(post))
-    extra=int(math.ceil(requested_extra/4))*4
-    rng=random.Random(f"{seed}|{pair['pair_id']}|{target_plies}")
+    if len(pos)!=len(neg):
+        raise ValueError("Unequal counterfactual lengths")
+    rng=random.Random(f"histchess-v4.1|{seed}|{pair['pair_id']}|{target_plies}")
     failures=[]
     for _ in range(attempts):
         try:
             if task=="castling":
-                a,b=replay(pos),replay(neg)
-                added=_tour(a,b,extra,rng)
-                new_pos=pos+added;new_neg=neg+added
+                extra=max(0,target_plies-len(pos))
+                add=_common_castling_suffix(pos,neg,extra,rng)
+                new_pos=pos+add
+                new_neg=neg+add
+                protocol="synthetic_common_castling_continuation_v2"
             else:
-                start_a=replay(pre); start_b=replay(pre)
-                added=_tour(start_a,start_b,extra,rng)
-                prefix=pre+added+post
-                new_pos=prefix+pos;new_neg=prefix+neg
+                extra=max(0,target_plies-len(pos))
+                prefix=_common_prefix(pos,neg,extra,rng,task)
+                new_pos=prefix+pos
+                new_neg=prefix+neg
+                protocol="synthetic_knight_cycles_with_pawn_resets_v2"
+            _verify_trajectory(new_pos)
+            _verify_trajectory(new_neg)
             rebuilt=pair_from_moves(task,new_pos,new_neg)
-            # Check all intermediate states, not only the final certificate.
-            for history in (new_pos,new_neg):
-                board=chess.Board()
-                for uci in history:
-                    board.push_uci(uci)
-                    if _automatic_outcome(board):
-                        raise ValueError("Intermediate automatic game outcome")
             if len(new_pos)<target_plies:
-                raise ValueError("Requested history minimum was not achieved")
-            rebuilt["generator_family"]=pair["generator_family"]
+                raise ValueError("Requested minimum history length not achieved")
+            rebuilt["generator_family"]=pair.get("generator_family","legacy")
             rebuilt["split"]=pair.get("split","unassigned")
-            rebuilt["stress_protocol"]="synthetic_reversible_knight_tour_v1"
-            rebuilt["first_divergence_distance"]=(len(new_pos)-next(
-                (i for i,(x,y) in enumerate(zip(new_pos,new_neg)) if x!=y),len(new_pos))-1)
+            rebuilt["stress_protocol"]=protocol
+            rebuilt["first_divergence_distance"]=len(new_pos)-1-next(
+                (i for i,(u,v) in enumerate(zip(new_pos,new_neg)) if u!=v),len(new_pos))
             return rebuilt
         except (ValueError,AssertionError) as exc:
             failures.append(str(exc))
-    raise RuntimeError(f"Cannot create a certified {target_plies}-ply {task} pair "
-                       f"after {attempts} attempts; last failure: {failures[-1] if failures else 'unknown'}")
+    raise RuntimeError(f"Cannot create certified {target_plies}-ply {task} pair "
+                       f"after {attempts} attempts; last failures: {failures[-3:]}")
 
 
 def extend_pairs(pairs,target_plies=64,seed=3101,attempts=100):
-    result=[]
+    output=[]
     used=set()
-    for ix,p in enumerate(pairs):
-        q=extend_pair(p,target_plies,seed,attempts)
-        if q["board_key"] in used:
-            raise RuntimeError(f"Stress construction duplicated the observable board at pair {ix}")
-        used.add(q["board_key"])
-        result.append(q)
-    return result
+    for i,pair in enumerate(pairs):
+        for retry in range(12):
+            extended=extend_pair(pair,target_plies,seed+retry*7919,attempts)
+            if extended["board_key"] not in used:
+                used.add(extended["board_key"])
+                output.append(extended)
+                break
+        else:
+            raise RuntimeError(f"Stress generation produced repeated observable boards: pair {i}")
+    return output

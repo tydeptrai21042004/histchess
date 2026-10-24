@@ -56,3 +56,24 @@ If the long-history generator cannot meet its requested target while keeping
 legal, non-terminal moves, it raises an error. Do not silently lower the
 requested length or substitute unvalidated records. For a non-long-history
 pipeline smoke test only, use `--long-target-plies 0` or omit it.
+
+
+## v4.1 correction — certified long-history generator
+
+The initial v4 synthetic history extension could exhaust 100 attempts with
+`No reversible knight move available`, and long knight-only walks were also
+vulnerable to automatic fivefold repetition. v4.1 replaces them with:
+
+- A **common legal continuation after castling-right divergence**, maintaining
+  identical visible boards while preserving distinct castling rights.
+- For other rules, **short reversible knight cycles interleaved with legal
+  irreversible pawn blocks** before the decisive suffix. This makes the input
+  long; it does NOT create a long causal dependency for these other rules.
+- Explicit replay of every intermediate position, automatic game-outcome
+  checks, and fully rebuilt labels/certificates.
+- A 64-ply regression covering all four rules and a small multi-family sample,
+  called by the Kaggle preflight tests before model training.
+
+Old v4 datasets and shards must not be resumed into v4.1. The runner uses
+separate `histchess_architecture_v4_1_*` result directories. Attach
+`HistChess_v4_1_code_patch.zip`, not the former v4 ZIP.

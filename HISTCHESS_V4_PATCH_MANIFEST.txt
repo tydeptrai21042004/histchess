@@ -12,3 +12,5 @@ bd4ad21647549b48bbc149f4bdb4165b53b7da0f25feb02924ec05900a4057d8  tests/test_arc
 fdbde6461aaccc8e1695002b30744a339ada2ac4d53da3e33ccc80ca5143af7d  docs/ARCHITECTURE_PAPERS_AND_PROTOCOL.md
 a02429f893ee2ea1143530bfd0cc6951e24686c5a0c77eede0cb1caed97fc3eb  KAGGLE_ARCHITECTURE_V4_ONE_CELL.py
 ddb55a5b84a747d8523b9419d09ecf71a776110e7d784bb974a957b4e8bbee69  HISTCHESS_V4_PATCH_README.md
+
+HistChess v4.1 correction: replace length_stress.py, tests/test_length_stress.py, and KAGGLE_ARCHITECTURE_V4_ONE_CELL.py; all other v4 benchmark code retained.
