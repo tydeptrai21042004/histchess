@@ -52,3 +52,46 @@ For balanced pairs with identical board and identical visible history suffix but
 - `architecture_run_shards/`: individually cached experiments to resume safely.
 
 Use `python scripts/run_architecture_benchmark.py --help` for options.
+
+## v4 optional methodology additions (source patch October 2026)
+
+The v3 release, including its existing 450 results, is preserved. Running v4
+creates a different fingerprint and must use a **new** output directory. These
+features are controls, not findings about real large language models.
+
+- `--position-encoding sinusoidal`: fixed (rather than randomly initialized
+  unseen learned) position signals. Does not guarantee length generalization.
+- `--length-eval-cutoffs 16 32 64 full --length-eval-train-cutoffs 16`:
+  evaluates the SAME trained 16-ply checkpoint using different observed
+  context windows. `architecture_length_ood_metrics.csv` explicitly lists the
+  fraction whose context **actually changed**. A nominal cutoff > example
+  length is not a longer example.
+- `--long-target-plies 64`: opt-in synthetic reversible knight excursions,
+  never silently treating shortened examples as successful. **Castling**
+  excursions follow the distinguishing event and thus stress its retention;
+  the other three tasks place neutral moves BEFORE their decisive suffix and
+  mainly test long-input processing, not long retention. This is NOT realistic
+  chess-game distribution or a benchmark of thousands of independent histories.
+  All histories are rechecked using python-chess including automatic terminal
+  outcomes. `tests/test_length_stress.py` runs in Kaggle with chess installed.
+- `--lr`, `--weight-decay`, and `--dropout` expose optimizer controls for
+  separate, validation-selected sweeps; no test-set hyperparameter tuning.
+- `observability_bounds.csv` now includes an **empirical observation-consistency
+  ceiling** computed from identical observable input signatures across the
+  held-out dataset, in addition to the looser pairwise ceiling.
+- `architecture_metrics.csv` adds calibrated Brier score and tie-aware
+  pair-ranking accuracy. The original record and strict joint-pair metrics
+  remain unchanged.
+- Resume fingerprints include complete pair data and source hashes for the
+  generator, model, and rule checker. Shards from older revisions intentionally
+  cannot be reused in the new experiment.
+- `scripts/verify_architecture_results.py` recomputes recorded metrics from
+  raw predictions and checks labels, membership, completeness, score ranges,
+  and the zero-history invariant. It has no pretrained-LLM dependency.
+
+**Still needed before a broad architecture claim:** independent new generator
+families (beyond the existing three), realistic game distributions, faithfully
+implemented S4D/Mamba baselines, actual long-dependency tasks beyond castling,
+validation-selected optimization, systematic parameter scale ablations, and
+independent-family uncertainty estimates. No code patch can substitute for
+these empirical controls, and no result by itself proves an LLM impossibility.

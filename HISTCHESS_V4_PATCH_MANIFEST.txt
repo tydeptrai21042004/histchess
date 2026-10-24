@@ -1,0 +1,14 @@
+# HistChess v4 changed-file patch
+
+Source: user uploaded histchess-main(2).zip
+v3 results must not be resumed as v4.
+
+Changed and new files (SHA256):
+d073730d94344b5c175f77e29e604692179729d662207db072db4d884eacf4bb  histchess/architecture_benchmark.py
+06829772e70f947128377a47b00f5dc2d0cfaaefbb32237914a85e911658867b  histchess/length_stress.py
+eed041623215062663db701ea5178119923f45a9a5057c4c6adc30bcfb148679  scripts/verify_architecture_results.py
+bd4ad21647549b48bbc149f4bdb4165b53b7da0f25feb02924ec05900a4057d8  tests/test_architecture_benchmark.py
+3e809ae4cb9536dfff3256678c88c184fea8df0757c0e95244fabf74d1ba098b  tests/test_length_stress.py
+fdbde6461aaccc8e1695002b30744a339ada2ac4d53da3e33ccc80ca5143af7d  docs/ARCHITECTURE_PAPERS_AND_PROTOCOL.md
+a02429f893ee2ea1143530bfd0cc6951e24686c5a0c77eede0cb1caed97fc3eb  KAGGLE_ARCHITECTURE_V4_ONE_CELL.py
+ddb55a5b84a747d8523b9419d09ecf71a776110e7d784bb974a957b4e8bbee69  HISTCHESS_V4_PATCH_README.md

@@ -175,18 +175,39 @@ class RealDiagonalSSMBlock(nn.Module):
         return x+self.drop(self.ff(self.norm2(x)))*valid.unsqueeze(-1)
 
 
+def sinusoidal_positions(length, width):
+    """Fixed positional signal with defined values at every permitted index.
+
+    Unlike a learned lookup, positions longer than those present in training
+    do not introduce randomly initialized, never-trained embedding vectors.
+    This does NOT guarantee successful length generalization.
+    """
+    position=torch.arange(length,dtype=torch.float32).unsqueeze(1)
+    inv=torch.exp(-math.log(10000.)*torch.arange(0,width,2,dtype=torch.float32)/width)
+    result=torch.zeros(length,width,dtype=torch.float32)
+    result[:,0::2]=torch.sin(position*inv)
+    result[:,1::2]=torch.cos(position*inv[:result[:,1::2].shape[1]])
+    return result
+
+
 class HistoryArchitecture(nn.Module):
-    def __init__(self,kind,width=64,max_history=256,dropout=0.1):
+    def __init__(self,kind,width=64,max_history=256,dropout=0.1,position_encoding="learned"):
         super().__init__()
         if kind not in ARCHITECTURES: raise ValueError(f"Unknown architecture: {kind}")
         if width%4:raise ValueError("width must be divisible by four")
+        if position_encoding not in ("learned","sinusoidal"):
+            raise ValueError("position_encoding must be learned or sinusoidal")
         self.kind=kind;self.width=width;self.max_history=max_history
+        self.position_encoding=position_encoding
         self.piece_embed=nn.Embedding(len(PIECES),12)
         self.board_net=nn.Sequential(nn.Linear(64*12,96),nn.ReLU(),nn.Dropout(dropout))
         self.side_embed=nn.Embedding(2,8); self.task_embed=nn.Embedding(len(TASKS),16)
         self.square_embed=nn.Embedding(65,width//2,padding_idx=0)
         self.promotion_embed=nn.Embedding(5,width)
-        self.position_embed=nn.Embedding(max_history+1,width)
+        if position_encoding=="learned":
+            self.position_embed=nn.Embedding(max_history+1,width)
+        else:
+            self.register_buffer("position_values",sinusoidal_positions(max_history+1,width),persistent=False)
         self.norm_input=nn.LayerNorm(width)
         if kind in ("elman_rnn","gru","lstm"):
             module={"elman_rnn":nn.RNN,"gru":nn.GRU,"lstm":nn.LSTM}[kind]
@@ -208,7 +229,9 @@ class HistoryArchitecture(nn.Module):
         if t>self.max_history:raise ValueError("Sequence exceeds max_history")
         x=self.square_embed(moves[:,:,:2]).flatten(2)+self.promotion_embed(moves[:,:,2])
         pos=torch.arange(t,device=moves.device).unsqueeze(0)
-        x=self.norm_input(x+self.position_embed(pos))
+        positions=(self.position_embed(pos) if self.position_encoding=="learned"
+                   else self.position_values[:t].unsqueeze(0))
+        x=self.norm_input(x+positions)
         valid=torch.arange(t,device=moves.device)[None,:]<lengths.clamp(min=1)[:,None]
         if self.kind in ("elman_rnn","gru","lstm"):
             packed=nn.utils.rnn.pack_padded_sequence(x,lengths.clamp(min=1).cpu(),
@@ -233,25 +256,42 @@ def num_parameters(model):return sum(x.numel() for x in model.parameters())
 
 
 def make_budgeted_model(kind,target=150000,max_history=256,dropout=0.10,
-                        widths=(32,40,48,56,64,72,80,96,112,128)):
+                        widths=(32,40,48,56,64,72,80,96,112,128),position_encoding="learned"):
     # Select width using a fixed public grid, never validation/test performance.
-    options=[HistoryArchitecture(kind,w,max_history,dropout) for w in widths]
+    options=[HistoryArchitecture(kind,w,max_history,dropout,position_encoding) for w in widths]
     best=min(options,key=lambda m:abs(num_parameters(m)-target))
     return best
 
 
-def _metrics(rows,preds):
-    items={(r["pair_id"],r["variant"]):(r["task"],int(r["label"]),int(g)) for r,g in zip(rows,preds)}
+def _metrics(rows,preds,scores=None):
+    """Paired metrics, including tie-aware ranking and probability calibration."""
+    if len(rows)!=len(preds) or (scores is not None and len(scores)!=len(rows)):
+        raise ValueError("Metrics rows, predictions and scores differ in length")
+    items={}
+    for i,(r,g) in enumerate(zip(rows,preds)):
+        key=(r["pair_id"],r["variant"])
+        if key in items:raise ValueError(f"Repeated prediction key: {key}")
+        items[key]=(r["task"],int(r["label"]),int(g),
+                    None if scores is None else float(scores[i]))
     result=[]
     for task in ("all",)+TASKS:
         sub={key:v for key,v in items.items() if task=="all" or v[0]==task}
         n=len(sub)
-        if n==0: raise RuntimeError(f"Empty test subset {task}")
+        if n==0:raise RuntimeError(f"Empty test subset {task}")
         correct=sum(int(v[1]==v[2]) for v in sub.values())
         ids={key[0] for key in sub}
+        if n!=2*len(ids):raise RuntimeError("Incomplete or duplicated pair members")
         joint=sum(int(sub[(pid,"positive")][2]==1 and sub[(pid,"negative")][2]==0) for pid in ids)
-        result.append({"task":task,"test_pairs":len(ids),"test_records":n,
-                       "record_accuracy":correct/n,"joint_pair_accuracy":joint/len(ids)})
+        record={"task":task,"test_pairs":len(ids),"test_records":n,
+                "record_accuracy":correct/n,"joint_pair_accuracy":joint/len(ids)}
+        if scores is not None:
+            rank=0.0; brier=0.0
+            for pid in ids:
+                pos=sub[(pid,"positive")][3];neg=sub[(pid,"negative")][3]
+                rank+=1 if pos>neg else 0.5 if pos==neg else 0
+                brier+=(1-pos)**2+neg**2
+            record.update(pair_ranking_accuracy=rank/len(ids),brier_score=brier/n)
+        result.append(record)
     return result
 
 
@@ -305,8 +345,20 @@ def observability_bounds(pairs, folds=(0,1,2), cutoffs=(0,4,8,16,None), max_hist
                 n=len(group)
                 if not n:raise ValueError("Empty held-out task")
                 frac=distinguishable/n
+                # The pairwise ceiling can be loose when visible signatures of
+                # different pairs collide. Include the exact empirical ceiling.
+                counts=collections.defaultdict(lambda:[0,0])
+                for p in group:
+                    for variant in ("positive","negative"):
+                        record=p[variant]
+                        history=record["history_uci"][-max_history:]
+                        if cutoff is not None:history=history[-cutoff:] if cutoff else []
+                        signature=(p["task"],p["board_key"],tuple(history))
+                        counts[signature][int(record["label"])]+=1
+                exact=sum(max(c) for c in counts.values())/(2*n)
                 results.append({"fold":fold,"history_plies":"full" if cutoff is None else cutoff,
-                    "task":task,"test_pairs":n,"distinguishable_pairs":distinguishable,
+                    "task":task,"test_pairs":n,"distinct_observations":len(counts),
+                    "empirical_observation_ceiling":exact,"distinguishable_pairs":distinguishable,
                     "indistinguishable_pairs":n-distinguishable,
                     "record_accuracy_upper_bound":0.5+frac/2,
                     "joint_pair_accuracy_upper_bound":frac})
@@ -323,7 +375,15 @@ def _one_run(pairs,kind,fold,cutoff,seed,options,output):
     device=torch.device(options.device)
     tensors={s:make_tensors(sets[s],cutoff,options.max_history,device)
              for s in sets}
-    model=make_budgeted_model(kind,options.target_parameters,options.max_history).to(device)
+    if cutoff==0:
+        signatures={}
+        for row in sets["test"]:
+            signature=(row["task"],row["board_key"])
+            signatures.setdefault(row["pair_id"],signature)
+            if signatures[row["pair_id"]]!=signature:
+                raise RuntimeError("Zero-history pair has unequal visible input")
+    model=make_budgeted_model(kind,options.target_parameters,options.max_history,
+                              options.dropout,position_encoding=options.position_encoding).to(device)
     params=num_parameters(model)
     optim=torch.optim.AdamW(model.parameters(),lr=options.lr,weight_decay=options.weight_decay)
     loss_fn=nn.BCEWithLogitsLoss()
@@ -363,7 +423,7 @@ def _one_run(pairs,kind,fold,cutoff,seed,options,output):
     inference_seconds=time.monotonic()-start
     preds=[int(v>=.5) for v in probabilities]
     met=[];pre=[]
-    for row in _metrics(sets["test"],preds):
+    for row in _metrics(sets["test"],preds,probabilities):
         met.append({"architecture":kind,"fold":fold,"seed":seed,
                     "history_plies":"full" if cutoff is None else str(cutoff),
                     "parameters":params,"target_parameters":options.target_parameters,
@@ -375,7 +435,38 @@ def _one_run(pairs,kind,fold,cutoff,seed,options,output):
                     "pair_id":row["pair_id"],"variant":row["variant"],
                     "task":row["task"],"family":row["generator_family"],
                     "label":row["label"],"prediction":p,"score":score})
-    return met,pre,curves
+    # Distinct evaluation only: train checkpoint and best epoch are held fixed.
+    # If the visible inputs are identical, this is reported, not called OOD.
+    ood_metrics=[];ood_predictions=[]
+    enabled_cutoffs=(options.length_eval_cutoffs
+                     if not options.length_eval_train_cutoffs or
+                        cutoff in options.length_eval_train_cutoffs else ())
+    for eval_cutoff in enabled_cutoffs:
+        if eval_cutoff==cutoff:continue
+        test_t=make_tensors(sets["test"],eval_cutoff,options.max_history,device)
+        scores=[]
+        with torch.inference_mode():
+            for ids in torch.arange(len(sets["test"]),device=device).split(options.batch_size):
+                scores.extend(torch.sigmoid(model(*(v[ids] for v in test_t[:5]))).cpu().tolist())
+        pred=[int(z>=0.5) for z in scores]
+        original_lengths=tensors["test"][4].cpu().tolist()
+        evaluated_lengths=test_t[4].cpu().tolist()
+        changed=sum(x!=y for x,y in zip(original_lengths,evaluated_lengths))
+        meta={"architecture":kind,"fold":fold,"seed":seed,
+              "training_history_plies":"full" if cutoff is None else str(cutoff),
+              "evaluation_history_plies":"full" if eval_cutoff is None else str(eval_cutoff),
+              "test_records_with_changed_context":changed,
+              "test_records_total":len(sets["test"]),
+              "evaluation_max_observed_length":max(evaluated_lengths),
+              "evaluation_min_observed_length":min(evaluated_lengths),
+              "best_epoch":best_epoch,"parameters":params}
+        for metric in _metrics(sets["test"],pred,scores):
+            ood_metrics.append({**meta,**metric})
+        for row,guess,score in zip(sets["test"],pred,scores):
+            ood_predictions.append({**meta,"pair_id":row["pair_id"],"variant":row["variant"],
+                "task":row["task"],"family":row["generator_family"],
+                "label":row["label"],"prediction":guess,"score":score})
+    return met,pre,curves,ood_metrics,ood_predictions
 
 
 def _write_architecture_analysis(out, metrics, predictions, seed=3101):
@@ -455,7 +546,9 @@ def _write_architecture_analysis(out, metrics, predictions, seed=3101):
 def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),seeds=(3101,3102,3103),
                                 cutoffs=(0,8,None),epochs=12,patience=4,batch_size=64,
                                 max_history=256,target_parameters=150000,
-                                lr=0.001,weight_decay=0.001,device="cpu"):
+                                lr=0.001,weight_decay=0.001,device="cpu",
+                                dropout=0.10,position_encoding="learned",length_eval_cutoffs=(),
+                                length_eval_train_cutoffs=()):
     """Runs architecture x fold x seed x history, saving partial progress on each run.
 
     No results are claimed until each stage completes. This routine never invokes
@@ -466,41 +559,54 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
     architectures=tuple(architectures or ARCHITECTURES)
     if not set(architectures)<=set(ARCHITECTURES):raise ValueError("Unrecognized architecture")
     if not folds or not seeds or not cutoffs or epochs<1 or patience<1 or batch_size<1 or max_history<1:raise ValueError("Bad run configuration")
+    if not (0 <= dropout < 1) or lr <= 0 or weight_decay < 0:raise ValueError("Bad optimizer parameters")
+    if length_eval_cutoffs and position_encoding!="sinusoidal":
+        raise ValueError("Use --position-encoding sinusoidal for explicit length-shift evaluation")
+    if any(c is not None and (c<0 or c>max_history) for c in length_eval_cutoffs):
+        raise ValueError("Length-evaluation cutoff is outside 0..max_history")
+    if any(c not in cutoffs for c in length_eval_train_cutoffs):
+        raise ValueError("Length-evaluation source cutoff must be one of the trained cutoffs")
     if len(set(folds))!=len(folds) or len(set(seeds))!=len(seeds) or len(set(cutoffs))!=len(cutoffs):raise ValueError("Repeated fold, seed or cutoff")
     torch.set_num_threads(min(4,os.cpu_count() or 1))
     options=argparse.Namespace(epochs=epochs,patience=patience,batch_size=batch_size,
         max_history=max_history,target_parameters=target_parameters,lr=lr,
-        weight_decay=weight_decay,device=device)
+        weight_decay=weight_decay,device=device,dropout=dropout,
+        position_encoding=position_encoding,length_eval_cutoffs=tuple(length_eval_cutoffs),
+        length_eval_train_cutoffs=tuple(length_eval_train_cutoffs))
     # Explicitly fail if full histories will silently be truncated.
     longest=max(len(p[v]["history_uci"]) for p in pairs for v in ("positive","negative"))
     if longest>max_history:raise ValueError(f"max_history={max_history} truncates history length {longest}")
     if any(c is not None and c>max_history for c in cutoffs):raise ValueError("Cutoff above max_history")
-    raw_path=out/"architecture_predictions.csv"
-    metrics_path=out/"architecture_metrics.csv"
-    curves_path=out/"architecture_learning_curves.csv"
     config={"models":{m: ARCHITECTURES[m] for m in architectures},"folds":list(folds),
             "seeds":list(seeds),"cutoffs":["full" if c is None else c for c in cutoffs],
             "history_max_in_dataset":longest,"max_history":max_history,
             "train_protocol":vars(options),"source":"synthetic diversified generator families",
+            "protocol_version":"histchess-v4-evaluation-2026-10",
             "move_encoding":"UCI from/to squares and promotion type (no unknown move vocabulary)",
             "notes":["No pretrained LLM tested. These models are trained from scratch.",
                      "This is a controlled architecture-family study, not exact replication of published experiments.",
                      "Diagonal SSM is a simplified real diagonal recurrence, not a faithful S4D reproduction.",
-                     "Confidence intervals across four task-specific families require further independent generators."]}
-    (out/"architecture_config.json").write_text(json.dumps(config,indent=2),encoding="utf8")
+                     "Only three generator families per task; add independent mechanisms for external validity."]}
     # Persist an individual, content-bound shard immediately after each training
     # run. Kaggle notebook interruptions can be resumed without fabricating output.
-    fingerprints={"model_config":config,"pair_ids":sorted(p["pair_id"] for p in pairs),
-                  "pair_histories":[[p[v]["history_uci"] for v in ("positive","negative")] for p in pairs]}
+    source_files=[Path(__file__),Path(__file__).with_name("core.py"),
+                  Path(__file__).with_name("diverse.py"),Path(__file__).with_name("length_stress.py")]
+    fingerprints={"model_config":config,
+                  "source_sha256":{f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in source_files},
+                  "torch_version":torch.__version__,
+                  "dataset_sha256":hashlib.sha256(json.dumps(
+                      sorted(pairs,key=lambda p:p["pair_id"]),sort_keys=True,
+                      separators=(",", ":")).encode()).hexdigest()}
     fingerprint=hashlib.sha256(json.dumps(fingerprints,sort_keys=True).encode()).hexdigest()
     runroot=out/"architecture_run_shards";runroot.mkdir(exist_ok=True)
     ident=out/"architecture_run_fingerprint.txt"
     if ident.is_file() and ident.read_text().strip()!=fingerprint:
         raise ValueError("Run parameters/dataset changed: choose a new output directory to avoid mixing experiments")
     ident.write_text(fingerprint+"\n")
+    (out/"architecture_config.json").write_text(json.dumps(config,indent=2),encoding="utf8")
     _write_csv(out/"observability_bounds.csv",
                observability_bounds(pairs,folds,cutoffs,max_history))
-    all_metrics=[];all_predictions=[];all_curves=[];completed=[]
+    all_metrics=[];all_predictions=[];all_curves=[];all_ood_metrics=[];all_ood_predictions=[];completed=[]
     try:
         for kind in architectures:
             for fold in folds:
@@ -514,19 +620,34 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
                             if record.get("fingerprint")!=fingerprint:
                                 raise ValueError("Cached run fingerprint mismatch: "+str(shard))
                             met,pre,curve=record["metrics"],record["predictions"],record["curve"]
+                            ood_met=record.get("length_ood_metrics",[])
+                            ood_pre=record.get("length_ood_predictions",[])
+                            if length_eval_cutoffs and (not length_eval_train_cutoffs or
+                                cutoff in length_eval_train_cutoffs) and any(x!=cutoff for x in length_eval_cutoffs) and not ood_met:
+                                raise RuntimeError("Resume shard lacks required length-shift evaluations")
                             print(f"[ARCH RESUME] {filename}",flush=True)
                         else:
                             print(f"[ARCH TRAIN] {filename}",flush=True)
-                            met,pre,curve=_one_run(pairs,kind,fold,cutoff,seed,options,out)
+                            met,pre,curve,ood_met,ood_pre=_one_run(pairs,kind,fold,cutoff,seed,options,out)
                             tmp=shard.with_suffix(".tmp")
                             tmp.write_text(json.dumps({"fingerprint":fingerprint,
-                                "metrics":met,"predictions":pre,"curve":curve}),encoding="utf8")
+                                "metrics":met,"predictions":pre,"curve":curve,
+                                "length_ood_metrics":ood_met,"length_ood_predictions":ood_pre}),encoding="utf8")
                             tmp.replace(shard)
+                        if len(met)!=5 or not all(row["architecture"]==kind and row["fold"]==fold and row["seed"]==seed for row in met):
+                            raise RuntimeError("Invalid cached/produced metrics shard")
+                        expected_test_pairs=sum(p["split"]=="test" for p in rotate_splits(pairs,fold))
+                        if len(pre)!=2*expected_test_pairs:
+                            raise RuntimeError("Invalid cached/produced prediction count")
                         all_metrics.extend(met);all_predictions.extend(pre);all_curves.extend(curve)
+                        all_ood_metrics.extend(ood_met);all_ood_predictions.extend(ood_pre)
                         completed.append({"model":kind,"fold":fold,"seed":seed,"history":tag})
                         _write_csv(out/"architecture_metrics.csv",all_metrics)
                         _write_csv(out/"architecture_predictions.csv",all_predictions)
                         _write_csv(out/"architecture_learning_curves.csv",all_curves)
+                        if length_eval_cutoffs:
+                            _write_csv(out/"architecture_length_ood_metrics.csv",all_ood_metrics)
+                            _write_csv(out/"architecture_length_ood_predictions.csv",all_ood_predictions)
                         (out/"architecture_status.json").write_text(json.dumps({
                             "complete":False,"runs":completed,"fingerprint":fingerprint},indent=2))
         _write_architecture_analysis(out,all_metrics,all_predictions)
@@ -545,6 +666,10 @@ def main():
     ap.add_argument("--out",default="histchess_architecture_results")
     ap.add_argument("--pairs-per-task",type=int,default=300)
     ap.add_argument("--generator-seed",type=int,default=3101)
+    ap.add_argument("--long-target-plies",type=int,default=0,
+                    help="Replace generated/external pairs with certified neutral-history stress pairs. "
+                         "These are synthetic, not realistic long games.")
+    ap.add_argument("--long-attempts",type=int,default=100)
     ap.add_argument("--architectures",nargs="+",choices=tuple(ARCHITECTURES),default=list(ARCHITECTURES))
     ap.add_argument("--folds",type=int,nargs="+",default=[0,1,2])
     ap.add_argument("--seeds",type=int,nargs="+",default=[3101,3102,3103])
@@ -555,23 +680,50 @@ def main():
     ap.add_argument("--max-history",type=int,default=256)
     ap.add_argument("--target-parameters",type=int,default=150000)
     ap.add_argument("--device",choices=("cpu","cuda"),default="cpu")
+    ap.add_argument("--lr",type=float,default=0.001)
+    ap.add_argument("--weight-decay",type=float,default=0.001)
+    ap.add_argument("--dropout",type=float,default=0.10)
+    ap.add_argument("--position-encoding",choices=("learned","sinusoidal"),default="learned")
+    ap.add_argument("--length-eval-cutoffs",nargs="*",default=[],
+                    help="Test a trained checkpoint at other history cutoffs; use sinusoidal positions")
+    ap.add_argument("--length-eval-train-cutoffs",nargs="*",default=[],
+                    help="Restrict length-shift tests to selected training cutoffs (default: all)")
     args=ap.parse_args()
     if args.pairs_jsonl:
         data=Path(args.pairs_jsonl).read_bytes()
         pairs=[json.loads(s) for s in data.decode("utf8").splitlines() if s.strip()]
-        sha=hashlib.sha256(data).hexdigest()
+        source_sha=hashlib.sha256(data).hexdigest()
     else:
         from .core import generate,validate
         pairs,_=generate(args.pairs_per_task,args.generator_seed,generator="diverse",split_strategy="family")
         validation=validate(pairs)
         if not validation["passed"]:raise RuntimeError(f"Failed rule replay: {validation['errors']}")
-        sha=hashlib.sha256(json.dumps(pairs,sort_keys=True).encode()).hexdigest()
-        p=Path(args.out)/"data"/"pairs.jsonl";p.parent.mkdir(parents=True,exist_ok=True)
-        with p.open("w",encoding="utf8") as f:
-            for item in pairs:f.write(json.dumps(item,ensure_ascii=False)+"\n")
+        source_sha=hashlib.sha256(json.dumps(pairs,sort_keys=True).encode()).hexdigest()
+    if args.long_target_plies:
+        from .length_stress import extend_pairs
+        pairs=extend_pairs(pairs,args.long_target_plies,args.generator_seed,args.long_attempts)
+    sha=hashlib.sha256(json.dumps(sorted(pairs,key=lambda p:p["pair_id"]),
+                                  sort_keys=True,separators=(",", ":")).encode()).hexdigest()
+    old_hash=Path(args.out)/"dataset_sha256.txt"
+    if old_hash.exists() and old_hash.read_text().strip()!=sha:
+        raise ValueError("Dataset differs from the recorded output. Use a NEW output directory; "
+                         "existing evidence was not modified.")
+    # Preserve the old result before new fingerprints/config/status are written.
+    p=Path(args.out)/"data"/"pairs.jsonl";p.parent.mkdir(parents=True,exist_ok=True)
+    with p.open("w",encoding="utf8") as f:
+        for item in pairs:f.write(json.dumps(item,ensure_ascii=False,sort_keys=True)+"\n")
     Path(args.out).mkdir(parents=True,exist_ok=True)
     (Path(args.out)/"dataset_sha256.txt").write_text(sha+"\n")
+    (Path(args.out)/"dataset_source_sha256.txt").write_text(source_sha+"\n")
     _check_pair_integrity(pairs)
+    length_rows=[]
+    for item in pairs:
+        for variant in ("positive","negative"):
+            history=item[variant]["history_uci"]
+            length_rows.append({"pair_id":item["pair_id"],"task":item["task"],
+                "family":item["generator_family"],"variant":variant,"history_length":len(history),
+                "first_divergence_distance":item.get("first_divergence_distance","")})
+    _write_csv(Path(args.out)/"history_length_profile.csv",length_rows)
     # Replay-validate when python-chess is present even for external datasets.
     from .core import validate
     report=validate(pairs)
@@ -580,7 +732,11 @@ def main():
     run_architecture_benchmark(pairs,args.out,architectures=args.architectures,folds=args.folds,
         seeds=args.seeds,cutoffs=tuple(None if x=="full" else int(x) for x in args.cutoffs),
         epochs=args.epochs,patience=args.patience,batch_size=args.batch_size,
-        max_history=args.max_history,target_parameters=args.target_parameters,device=args.device)
+        max_history=args.max_history,target_parameters=args.target_parameters,device=args.device,
+        lr=args.lr,weight_decay=args.weight_decay,dropout=args.dropout,
+        position_encoding=args.position_encoding,
+        length_eval_cutoffs=tuple(None if x=="full" else int(x) for x in args.length_eval_cutoffs),
+        length_eval_train_cutoffs=tuple(None if x=="full" else int(x) for x in args.length_eval_train_cutoffs))
 
 
 if __name__=="__main__":main()
