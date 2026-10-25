@@ -1,4 +1,4 @@
-"""CPU-first, honest HistChess neural + classical comparison pipeline.
+"""Resumable CPU/GPU HistChess neural + classical comparison pipeline.
 
 Usage: python scripts/run_research_pipeline.py --profile pilot --out results
 All generated scores originate in the executed models and validated chess pairs.
@@ -21,7 +21,7 @@ PROFILES={
              'cutoffs':['0','16'], 'epochs':2,'pairs':30,'target_parameters':150000},
     'full':{'models':['elman_rnn','lstm','gru','causal_transformer','linear_attention','diagonal_ssm'],
             'folds':[0,1,2], 'seeds':[3101,3102,3103,3104,3105],
-            'cutoffs':['0','4','8','16','full'],'epochs':14,'pairs':300,'target_parameters':150000},
+            'cutoffs':['0','4','8','16','full'],'epochs':50,'pairs':300,'target_parameters':150000},
 }
 
 def call(label,command,logdir):
@@ -46,17 +46,26 @@ def run_pipeline(argv=None):
     ap.add_argument('--max-history',type=int,default=256)
     ap.add_argument('--epochs',type=int,help='Override max epochs')
     ap.add_argument('--pairs-per-task',type=int,help='Override new pairs per task')
+    ap.add_argument('--device',choices=('auto','cpu','cuda'),default='auto')
+    ap.add_argument('--max-new-runs',type=int,default=0,help='Pause after N new neural configurations; 0 means no run-count limit')
+    ap.add_argument('--max-session-seconds',type=int,default=0,help='Pause between runs when time budget is reached')
+    ap.add_argument('--patience',type=int,default=7,help='Validation-loss early stopping patience')
     args=ap.parse_args(argv)
     if args.long_target_plies not in (0,64):
         raise ValueError('Supported stress setting is 64 plies, or 0 for validated normal pipeline')
     cfg=dict(PROFILES[args.profile])
     if args.epochs is not None:cfg['epochs']=args.epochs
     if args.pairs_per_task is not None:cfg['pairs']=args.pairs_per_task
-    if cfg['epochs']<1 or cfg['pairs']<3:raise ValueError('Invalid epoch or pair count')
+    if cfg['epochs']<1 or cfg['pairs']<3 or args.patience<1:raise ValueError('Invalid epoch, patience or pair count')
+    import torch
+    device=('cuda' if torch.cuda.is_available() else 'cpu') if args.device=='auto' else args.device
+    if device=='cuda' and not torch.cuda.is_available():raise RuntimeError('CUDA requested but unavailable')
     out=Path(args.out).expanduser().resolve();out.mkdir(parents=True,exist_ok=True)
     logs=out/'pipeline_logs';logs.mkdir(exist_ok=True)
     status={'complete':False,'profile':args.profile,'stages':[],
             'settings':cfg,'long_target_plies':args.long_target_plies,
+            'device':device,'patience':args.patience,
+            'expected_neural_runs':len(cfg['models'])*len(cfg['folds'])*len(cfg['seeds'])*len(cfg['cutoffs']),
             'note':'Classical benchmark is same-pair, NOT external or pretrained.'}
     status_file=out/'pipeline_status.json'
     def persist():status_file.write_text(json.dumps(status,indent=2,default=str),encoding='utf8')
@@ -76,15 +85,27 @@ def run_pipeline(argv=None):
         cmd=[sys.executable,'scripts/run_architecture_benchmark.py','--out',out,
              '--architectures',*cfg['models'],'--folds',*map(str,cfg['folds']),
              '--seeds',*map(str,cfg['seeds']),'--cutoffs',*cfg['cutoffs'],
-             '--epochs',str(cfg['epochs']),'--patience','4','--batch-size','64',
+             '--epochs',str(cfg['epochs']),'--patience',str(args.patience),'--batch-size','64',
              '--max-history',str(args.max_history),'--target-parameters',str(cfg['target_parameters']),
-             '--device','cpu','--position-encoding','sinusoidal',
+             '--device',device,'--position-encoding','sinusoidal',
              '--length-eval-cutoffs','16','32','64','full',
              '--length-eval-train-cutoffs','16','--generator-seed','3101']
+        if args.max_new_runs:cmd+=['--max-new-runs',str(args.max_new_runs)]
+        if args.max_session_seconds:cmd+=['--max-session-seconds',str(args.max_session_seconds)]
         if args.long_target_plies:cmd+=['--long-target-plies',str(args.long_target_plies)]
         if args.pairs_jsonl:cmd+=['--pairs-jsonl',args.pairs_jsonl]
         else:cmd+=['--pairs-per-task',str(cfg['pairs'])]
         step('03_neural',cmd)
+        interim=json.loads((out/'architecture_status.json').read_text(encoding='utf8'))
+        if not interim.get('complete'):
+            if not interim.get('paused'):
+                raise RuntimeError('Neural benchmark incomplete without a safe pause')
+            status['paused']=True
+            status['neural_runs_completed']=len(interim.get('runs',[]))
+            status['remaining_runs']=status['expected_neural_runs']-status['neural_runs_completed']
+            print('SAFE PAUSE:',status['neural_runs_completed'],'of',status['expected_neural_runs'],
+                  'neural configurations. Attach output ZIP to next Kaggle session.',flush=True)
+            return
         step('04_neural_audit',[sys.executable,'scripts/verify_architecture_results.py',out,
                                 '--write',out/'independent_integrity_audit.json'])
         compare=[sys.executable,'scripts/run_comparison_baselines.py',
@@ -102,6 +123,8 @@ def run_pipeline(argv=None):
             raise RuntimeError('Completion manifest failed verification')
         for p in ['independent_integrity_audit.json','comparison_integrity_audit.json']:
             if not json.loads((out/p).read_text())['passed']:raise RuntimeError(f'Incomplete integrity audit: {p}')
+        if args.profile=='full':
+            step('08_manuscript_tables',[sys.executable,'scripts/make_manuscript_tables.py',out])
         status['complete']=True;status['neural_runs']=n
         print('ALL STAGES AND INDEPENDENT AUDITS COMPLETE:',n,'neural runs',flush=True)
     except BaseException as exc:

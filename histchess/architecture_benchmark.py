@@ -548,7 +548,7 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
                                 max_history=256,target_parameters=150000,
                                 lr=0.001,weight_decay=0.001,device="cpu",
                                 dropout=0.10,position_encoding="learned",length_eval_cutoffs=(),
-                                length_eval_train_cutoffs=()):
+                                length_eval_train_cutoffs=(),max_new_runs=0,max_session_seconds=0):
     """Runs architecture x fold x seed x history, saving partial progress on each run.
 
     No results are claimed until each stage completes. This routine never invokes
@@ -559,6 +559,8 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
     architectures=tuple(architectures or ARCHITECTURES)
     if not set(architectures)<=set(ARCHITECTURES):raise ValueError("Unrecognized architecture")
     if not folds or not seeds or not cutoffs or epochs<1 or patience<1 or batch_size<1 or max_history<1:raise ValueError("Bad run configuration")
+    if max_new_runs<0 or max_session_seconds<0:raise ValueError("Limits must be nonnegative")
+    if device=="cuda" and not torch.cuda.is_available():raise RuntimeError("CUDA requested, but unavailable")
     if not (0 <= dropout < 1) or lr <= 0 or weight_decay < 0:raise ValueError("Bad optimizer parameters")
     if length_eval_cutoffs and position_encoding!="sinusoidal":
         raise ValueError("Use --position-encoding sinusoidal for explicit length-shift evaluation")
@@ -581,7 +583,7 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
             "seeds":list(seeds),"cutoffs":["full" if c is None else c for c in cutoffs],
             "history_max_in_dataset":longest,"max_history":max_history,
             "train_protocol":vars(options),"source":"synthetic diversified generator families",
-            "protocol_version":"histchess-v5-evaluation-2026-10",
+            "protocol_version":"histchess-v6-publication-full-2026-10",
             "move_encoding":"UCI from/to squares and promotion type (no unknown move vocabulary)",
             "notes":["No pretrained LLM tested. These models are trained from scratch.",
                      "This is a controlled architecture-family study, not exact replication of published experiments.",
@@ -607,6 +609,9 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
     _write_csv(out/"observability_bounds.csv",
                observability_bounds(pairs,folds,cutoffs,max_history))
     all_metrics=[];all_predictions=[];all_curves=[];all_ood_metrics=[];all_ood_predictions=[];completed=[]
+    newly_trained=0
+    clock_start=time.monotonic()
+    total_expected=len(architectures)*len(folds)*len(seeds)*len(cutoffs)
     try:
         for kind in architectures:
             for fold in folds:
@@ -629,6 +634,7 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
                         else:
                             print(f"[ARCH TRAIN] {filename}",flush=True)
                             met,pre,curve,ood_met,ood_pre=_one_run(pairs,kind,fold,cutoff,seed,options,out)
+                            newly_trained+=1
                             tmp=shard.with_suffix(".tmp")
                             tmp.write_text(json.dumps({"fingerprint":fingerprint,
                                 "metrics":met,"predictions":pre,"curve":curve,
@@ -650,6 +656,17 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
                             _write_csv(out/"architecture_length_ood_predictions.csv",all_ood_predictions)
                         (out/"architecture_status.json").write_text(json.dumps({
                             "complete":False,"runs":completed,"fingerprint":fingerprint},indent=2))
+                        if len(completed)<total_expected and (
+                            (max_new_runs and newly_trained>=max_new_runs) or
+                            (max_session_seconds and time.monotonic()-clock_start>=max_session_seconds)
+                        ):
+                            reason="new-run budget" if max_new_runs and newly_trained>=max_new_runs else "session clock budget"
+                            (out/"architecture_status.json").write_text(json.dumps({
+                                "complete":False,"paused":True,"reason":reason,
+                                "runs":completed,"new_runs_this_session":newly_trained,
+                                "expected_runs":total_expected,"fingerprint":fingerprint},indent=2))
+                            print(f"[ARCH PAUSED] {len(completed)}/{total_expected}; {reason}. Save ZIP and resume with identical inputs.",flush=True)
+                            return all_metrics
         _write_architecture_analysis(out,all_metrics,all_predictions)
         (out/"architecture_status.json").write_text(json.dumps({
             "complete":True,"runs":completed,"fingerprint":fingerprint},indent=2))
@@ -680,6 +697,8 @@ def main():
     ap.add_argument("--max-history",type=int,default=256)
     ap.add_argument("--target-parameters",type=int,default=150000)
     ap.add_argument("--device",choices=("cpu","cuda"),default="cpu")
+    ap.add_argument("--max-new-runs",type=int,default=0,help="Safely pause after N newly trained configurations (0=unlimited)")
+    ap.add_argument("--max-session-seconds",type=int,default=0,help="Pause between configurations after session budget (0=unlimited)")
     ap.add_argument("--lr",type=float,default=0.001)
     ap.add_argument("--weight-decay",type=float,default=0.001)
     ap.add_argument("--dropout",type=float,default=0.10)
@@ -736,7 +755,8 @@ def main():
         lr=args.lr,weight_decay=args.weight_decay,dropout=args.dropout,
         position_encoding=args.position_encoding,
         length_eval_cutoffs=tuple(None if x=="full" else int(x) for x in args.length_eval_cutoffs),
-        length_eval_train_cutoffs=tuple(None if x=="full" else int(x) for x in args.length_eval_train_cutoffs))
+        length_eval_train_cutoffs=tuple(None if x=="full" else int(x) for x in args.length_eval_train_cutoffs),
+        max_new_runs=args.max_new_runs,max_session_seconds=args.max_session_seconds)
 
 
 if __name__=="__main__":main()
