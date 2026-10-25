@@ -95,3 +95,9 @@ implemented S4D/Mamba baselines, actual long-dependency tasks beyond castling,
 validation-selected optimization, systematic parameter scale ablations, and
 independent-family uncertainty estimates. No code patch can substitute for
 these empirical controls, and no result by itself proves an LLM impossibility.
+
+## v5 reproducible classical benchmark (October 2026)
+
+The additional benchmark is a **within-HistChess same-pair comparison**, not a new external chess dataset. Fixed balanced `board_only` (p=0.5) is an input-observability control; `move_bag` and `move_ngrams` are sparse-feature L2 logistic-regression controls (validation-selected `C=0.1,1,10`). Their train/validation/test generator-family rotation, history cutoff, test pair IDs, and withheld FEN metadata match the neural benchmark. `privileged_replay_oracle` directly reads the verified labels and is an **upper reference only**; its perfect performance is not an independent demonstration of learned state tracking. Predictive trainable comparisons appear in `neural_vs_classical_matched.csv` with paired record and strict joint-pair differences. No p-value or broad causality claim is inferred from that descriptive table.
+
+Entrypoint: `scripts/run_research_pipeline.py` (CPU pilot/full profiles). The `--long-target-plies 64` synthetic generator remains **opt-in experimental**; default 0 so the known v4/v4.1 extension reliability problem cannot silently corrupt or block ordinary comparisons. Explicitly requested 64-ply generation fails closed if not certified. The file `README.md` gives the actual CLI settings, output layout and audit commands.

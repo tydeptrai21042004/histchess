@@ -1,0 +1,6 @@
+# Local CPU v5 only. On Kaggle, keep the preinstalled PyTorch instead of reinstalling.
+chess==1.11.2
+numpy>=1.24,<3
+scikit-learn>=1.3,<2
+torch>=2.2
+pytest>=7,<10

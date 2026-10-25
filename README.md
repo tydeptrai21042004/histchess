@@ -1,101 +1,136 @@
-# HistChess: GPU single-session paper reproduction
+# HistChess — Counterfactual Chess-History Architecture Benchmark
 
-**New version:** An end-to-end experiment runner for a synthetic matched-counterfactual chess-history benchmark. **All results must be computed by execution. This ZIP does not contain measured paper numbers or the manuscript.**
+**Release: v5 (October 2026).** HistChess tests whether learning systems recover **history-dependent chess state** from a visible board, side-to-move and legal move history. It generates matched positive/negative histories that end at the **same observable board**, but disagree on a precisely specified hidden chess-rule label. A new **classical comparison track** uses the *same held-out counterfactual pair IDs* as six causal neural architectures. Results are only produced by executing code; there are **no prefilled model scores**.
 
-## Important chess rule definition
+> **Scientific scope:** This is a synthetic, legality-verified benchmark, not a pretrained-LLM experiment, real-game evaluation, or proof of fundamental impossibility for Transformers/LLMs. The diagonal SSM is an **S4D-inspired real-valued ablation**, not the authors' S4D. The new classical comparison is **within-dataset**, not an external public benchmark.
 
-Four binary tasks are generated from legal histories starting at the conventional initial chess position:
+## 1. Tasks and input permissions
 
-- **White kingside castling rights** (not immediate legality).
-- **Legal en-passant capture** for the side to move.
-- **Halfmove clock >= 2** (not the fifty-move draw).
-- **Current position appears >=3 times**, including now (not prospective claimability).
+| Task | Positive label means | What is deliberately withheld from trainable models |
+| --- | --- | --- |
+| `castling` | White retains **kingside castling rights** (not necessarily a legal castle move now) | Castling-right FEN flags |
+| `en_passant` | Side to move has a **legal en-passant capture** | En-passant FEN square |
+| `halfmove` | `halfmove_clock >= 2` (not 50/75-move draw) | Halfmove clock |
+| `repetition` | Current position has occurred **at least three times, including now** | Occurrence history and count |
 
-The castling example labels in the earlier scaffold were **inverted**; this is fixed. The positive history leaves the white h1 rook unmoved. The negative history moves it out and back, permanently losing castling rights. The pair is otherwise identical in observable piece placement and side to move. Each pair is independently reconstructed and audited with `chess.Board()` and legal move replay. Repetition pairs have *identical full FENs* but different occurrence counts. Castling, EP and halfmove pairs differ in one canonical FEN field each.
+Neural and classical learned models get the same general observable information: current piece placement, side to move, task and the allowed UCI history suffix. They **never** receive canonical full FEN, hidden labels, or chess-rule metadata as features. The `privileged_replay_oracle` intentionally uses ground truth and **must not be reported as a fair learned-model competitor**.
 
-The rules for current-position repetition in `python-chess` deliberately differ from `can_claim_threefold_repetition()` (possible future moves): see <https://python-chess.readthedocs.io/en/latest/core.html>.
+Every counterfactual pair contains equally long, individually replayable legal histories with opposite labels. The generator and checker use `python-chess`; they are not two independent rule engines.
 
-## Kaggle full GPU run from zero
+## 2. What is compared?
 
-1. Create a Kaggle Notebook. Turn on **Internet** (to download open-weight models) and select **GPU T4/P100**. A CPU runtime is rejected by default.
-2. Upload `histchess_gpu_full.zip` as a Kaggle Input Dataset, **or** push its contents to your GitHub repository and supply `REPO_URL` in the bootstrap.
-3. Paste the entire `KAGGLE_ONE_CELL.py` into one Python cell and run. It installs only small missing packages; **it never replaces Kaggle's preinstalled GPU PyTorch**.
-4. Download `/kaggle/working/histchess_results.zip` from Kaggle Outputs; check `run_status.json` and `manifest.json`. Only report rows actually computed by this run.
+| Track | Models | Interpretation |
+| --- | --- | --- |
+| Neural architectures | `elman_rnn`, `lstm`, `gru`, `causal_transformer`, `linear_attention`, `diagonal_ssm` | Trained-from-scratch, approximately matched parameter budgets and causal histories |
+| Classical benchmark | `board_only`, `move_bag`, `move_ngrams` | Null and regularized logistic-regression controls using the exact same test pair IDs |
+| Analytical reference | `privileged_replay_oracle` | Perfect reference deliberately using privileged target information; **not a fair baseline** |
 
-Default full mode: **300 pairs per task** (2,400 position-history records), 2 GPU GRU training seeds, independently retrained 0/4/8/16/32/full-ply models, 14 maximum epochs with best validation selection, and two pretrained SmolLM2 language models on the *same fixed held-out matched sample* of 24 pairs per task (48 records per task). Generation/split/test sizes vary if you edit the settings; model comparisons are strictly sampled from held-out positions.
+`move_bag` uses frequency of observed UCI moves without order. `move_ngrams` also includes adjacent move 2/3-grams and last-four-move identity features. For these two models, logistic-regression regularization is selected using **validation BCE/log-loss only** from `C in {0.1, 1, 10}`. Each neural architecture selects its best checkpoint by validation BCE. No reported test scores are used to select settings.
 
-To test the environment without claiming completed results, change `MODE='smoke'`. For larger paper experiments, raise `PAIRS_PER_TASK`, `TRAIN_SEEDS`, `GRU_EPOCHS`, and `LLM_PAIRS_PER_TASK` gradually, ensuring each task has enough held-out pairs. No result is fabricated on failure: partial outputs are zipped and `run_status.json` documents the error.
+**Matched comparison:** `neural_vs_classical_matched.csv` calculates differences within the same fold, cutoff, and held-out pair IDs. It does not treat seeds/folds as independent new chess generators.
 
-## Included evaluations
+## 3. Quick start — Kaggle CPU (recommended)
 
-1. Four-task synthetic paired data with replay certificates and legal move checks.
-2. Fresh replay-validation of labels, same-board constraint, single-FEN-field checks, and repetition same-FEN checks.
-3. Privileged rule oracle, board-only balanced majority, privileged full-FEN analytical baseline.
-4. Trainable **board-only neural control** (`history_moves=0`) and 4/8/16/32/full histories, retrained for each cutoff and GPU seed. All share the same board observation and task; never access true FEN metadata.
-5. Strict joint paired accuracy; missing or invalid model replies count as wrong in reported record accuracy.
-6. Board/FEN/history split overlap counts; synthetic-prefix overlap disclosure.
-7. Multiple model seeds, early stopping on validation BCE, saved full-history checkpoint, learning curves, per-record test predictions.
-8. Batched two-pretrained-model GPU inference (history-only prompts; no canonical full FEN). Fixed sample manifest and raw replies retained.
-9. Pair-resampling 95% confidence intervals, paired sign-flip comparisons against balanced board-majority (unadjusted exploratory p-values), plus **fair neural-versus-LLM matched-sample metrics** calculated using exactly the same test pair IDs.
-10. Paper-ready `.md` and `.tex` tables, two PNG figures, integrity audit, diagnostics, manifest and a compact ZIP (pretrained weights excluded).
+1. Set **Accelerator = None**, **Internet = On** in Kaggle.
+2. Commit all files from the v5 patch ZIP to the **root** of your HistChess GitHub repository, *or* upload `HistChess_v5_code_patch.zip` as a Kaggle Input.
+3. Paste **`KAGGLE_HISTCHESS_V5_ONE_CELL.py`** into a notebook cell, retain `PROFILE='pilot'`, and run. If v5 is not yet on GitHub, the cell must see the patch ZIP in Kaggle Inputs.
+4. The cell clones the repository, applies the patch if attached, installs the small CPU dependencies while keeping Kaggle's installed PyTorch, runs preflight tests, trains, runs the independent comparison, verifies raw scores, and packages both output and diagnostics ZIPs.
+5. Once the pilot passes, set `PROFILE='full'` for the full run. **The full CPU run is substantially more expensive**; Kaggle session time limits can interrupt it, so keep and reattach completed output archives for supported resume behavior. Never combine v3/v4/v4.1 shards with v5 outputs.
 
-## Limitations you must state in the manuscript
-
-- This is **synthetic, template-family-controlled data**. Group-disjoint-by-board splits do not provide independent opening, game, or template family splits. Increased *quantity* alone does not demonstrate real-game generalization.
-- There are few underlying counterfactual mechanisms; models may exploit generator cues. More independently sourced counterfactual motifs or an entirely new held-out generator are recommended for a stronger journal submission.
-- The full-FEN analytical reference directly reveals three labels and cannot be treated as a fair history-only neural comparison. Repetition is *not* available in a single FEN.
-- Oracle validation depends on one implementation, `python-chess`, plus checked algebraic invariants. It is not an independent chess rules engine.
-- Each neural history-length cutoff is *retrained*, not a drop-history-at-inference-only experiment. "Full" retains the last `MAX_HISTORY=128` plies, which covers supplied synthetic generators but should be reported accurately.
-- LLM results come from a **fixed held-out diagnostic subset**. Direct LLM/neural comparisons must use identical test pairs; `matched_sample_comparison.csv` explicitly performs that restriction.
-- Multi-seed variance is not a substitute for independent dataset families. Bootstrap intervals describe sampled test pairs under the generating mechanism.
-- A successful run does **not** imply the unspecified manuscript's every experiment has been reproduced: the paper itself was not attached.
-
-## Commands
+**Alternative: local environment**, Python 3.10+ with a compatible PyTorch installation:
 
 ```bash
-pip install -r requirements.txt
-python scripts/selftest.py
-python scripts/run_all_kaggle.py --out results --allow-cpu --smoke
-# Kaggle GPU full:
-python scripts/run_all_kaggle.py --out /kaggle/working/histchess_results --pairs-per-task 300 --epochs 14 --train-seeds 2 --llm-pairs-per-task 24
+python -m pip install -r requirements-v5-cpu.txt
+python scripts/run_research_pipeline.py --profile pilot --out results/histchess_v5_pilot
 ```
 
-Output paths: `data/pairs.jsonl`, `data/generation_rejections.json`, `validation.json`, `dataset_split_summary.json`, `baseline_metrics.csv`, `leakage_audit.json`, `gru_metrics.csv`, `gru_predictions.csv`, `gru_learning_curve.csv`, `history_ablation.csv`, `gru_model_config.json`, `history_gru_best.pt`, `llm_sample.json`, `llm_predictions.csv`, `llm_metrics.csv`, `paired_confidence_intervals.csv`, `matched_sample_comparison.csv`, `paired_significance.csv`, `paper_tables.md`, `paper_tables.tex`, `figures/*.png`, `final_output_audit.json`, `run_status.json`, `manifest.json`.
-
-## Reliability upgrade (20 October 2026)
-
-This revision adds focused pytest suites (replayed chess laws, illegal moves,
-FEN invariants, pairing certificates, deterministic synthetic generation,
-negative/corrupted data tests, train/test overlap, encoding, LLM parsing,
-paired bootstrap, corrupted prediction audit, ZIP release validation), a
-small real CUDA neural-training integration test, and an offline mocked LLM
-batching/invalid-reply integration test. A `scripts/stress_test.py` command
-validates generation across multiple random seeds. The notebook now creates
-`histchess_diagnostics.zip` even if installation, tests, or the training run
-fails before normal packaging. Diagnostics retain Kaggle logs and the exact
-bootstrap exception. No SVG files are generated; publication figures are PNG.
-
-### Suggested validation sequence
+After passing the pilot:
 
 ```bash
-# First attach the updated ZIP as a Kaggle Input, set accelerator GPU and Internet ON.
-# The full one-cell bootstrap automatically runs:
-python scripts/selftest.py
-python -m pytest -q tests -m "not slow and not gpu_integration"
-python scripts/run_all_kaggle.py --smoke --skip-llm
-
-# Optional extra stress/integration runs:
-python -m pytest -q tests -m slow
-python -m pytest -q tests/test_gpu_integration.py -m gpu_integration
-python scripts/stress_test.py --pairs-per-task 60 --seeds 3101 3102 3103
-
-# After a complete run:
-python scripts/verify_artifacts.py /kaggle/working/histchess_results.zip
+python scripts/run_research_pipeline.py --profile full --out results/histchess_v5_full
 ```
 
-**Environment limitations:** The source build/ZIP checks can run without a GPU.
-Chess replay, synthetic generation and all live CUDA/LLM tests require
-Kaggle dependencies and a GPU. Tests that use mocked model inference validate
-only the caller's logic; they do not establish inference correctness for a
-real Hugging Face model. No numerical experimental results are pre-populated
-in the code archive.
+For a quick standalone classical comparison **after** an existing neural run:
+
+```bash
+python scripts/run_comparison_baselines.py \
+  --pairs-jsonl results/histchess_v5_pilot/data/pairs.jsonl \
+  --out results/histchess_v5_pilot \
+  --folds 0 --cutoffs 0 16
+python scripts/verify_comparison_results.py results/histchess_v5_pilot
+python scripts/make_comparison_table.py results/histchess_v5_pilot
+```
+
+**Caution on reruns:** output directories are fingerprint-bound. If dataset, code, cutoff, seeds, or training setup changes, use a **new output directory**. Re-running unchanged settings can resume verified neural run shards. The classical track is deterministically recomputed and independently checked.
+
+## 4. Pilot and full profiles
+
+| Setting | `pilot` (pipeline default) | `full` |
+| --- | --- | --- |
+| Neural architectures | GRU + causal Transformer | Six architectures |
+| Rotated family folds | 1 | 3 |
+| Seeds | 1 | 5 |
+| History cutoffs | `0`, `16` | `0`, `4`, `8`, `16`, `full` |
+| Training epochs (upper bound) | 2 | 14 |
+| Generated pairs per task | 30 | 300 |
+| Nominal neural runs | **4** | **450** |
+| Classical comparisons | 4 controls × folds × cutoffs | Same controls × folds × cutoffs |
+| Context evaluation (trained at cutoff 16) | 16, 32, 64, full | 16, 32, 64, full |
+| 64-ply synthetic stress | **OFF** | **OFF** |
+
+The additional context evaluations reuse the trained 16-ply checkpoint; they **do not automatically create longer examples**. In the default source generator most full histories are short. The summary explicitly tracks test records whose visible input changes.
+
+### Optional long-history generator — experimental, NOT the default
+
+The source includes `--long-target-plies 64` as an **opt-in synthetic stress generator**, not a validated, published long-context result. The earlier v4 generator failed on castling and v4.1 was not yet fully verified against the complete chess-specific suite. This release **does not silently fall back** to shorter sequences: an opt-in failure stops with diagnostics. Do not enable it for the first pilot.
+
+```bash
+# Only after the default pilot succeeds, use a NEW output directory:
+python scripts/run_research_pipeline.py --profile pilot \
+  --long-target-plies 64 --out results/histchess_v5_stress_experimental
+```
+
+Under this generator, castling may involve a long gap after the critical move; other tasks commonly prepend neutral moves and therefore do **not** establish long-distance dependency retention. See `docs/ARCHITECTURE_PAPERS_AND_PROTOCOL.md`.
+
+## 5. Auditing outputs
+
+All results are stored under the selected output directory. Key files:
+
+| Path | Contents |
+| --- | --- |
+| `pipeline_status.json`, `pipeline_logs/*.log` | Stage success/failure, stage output and settings |
+| `data/pairs.jsonl`, `dataset_validation.json`, `history_length_profile.csv` | Full replay-verifiable data, rule checks, length distribution |
+| `architecture_metrics.csv`, `architecture_predictions.csv` | Neural metrics and every held-out raw prediction |
+| `architecture_summary.csv`, `architecture_length_ood_metrics.csv` | Descriptive aggregates and fixed-checkpoint context evaluations |
+| `comparison_metrics.csv`, `comparison_predictions.csv` | Non-neural controls on the same test pairs |
+| `comparison_summary.csv`, `comparison_validation_selection.csv` | Classical fold summaries and validation-selected regularization |
+| `neural_vs_classical_matched.csv` | Exact matched fold/seed/cutoff comparative scores |
+| `independent_integrity_audit.json`, `comparison_integrity_audit.json` | Independent raw-score audits; both must say `passed: true` |
+
+Run both checks manually at any time:
+
+```bash
+python scripts/verify_architecture_results.py results/histchess_v5_pilot
+python scripts/verify_comparison_results.py results/histchess_v5_pilot
+```
+
+**Zero-context invariants:** If both histories in a balanced pair are identical to the model at cutoff zero, any deterministic classifier must score exactly 50% record accuracy and **0% strict joint-pair accuracy** on those pairs. The audits enforce this. The privileged oracle is excluded because it has target information.
+
+## 6. Methodology boundaries for publications
+
+- Three generator families per task are rotated among train, validation and test. These are **correlated synthetic splits**, not independent real-game samples. No external chess-PGN benchmark is executed by the new classical track.
+- A 150k-parameter recurrent or attention network is not an off-the-shelf LLM. The experiment cannot show that large language models have a mathematical flaw.
+- `diagonal_ssm` is **not** an implementation of the full published S4D or Mamba method.
+- Most ordinary synthetic histories are **short**. Testing nominal 64/256 cutoffs on 24-ply examples is not a real long-context evaluation.
+- Equal parameter counts do not equal computational cost or optimization quality. Training epochs and optimizer budgets can affect outcomes.
+- The pairwise observability bound separates unavailable information from learnable information; a residual neural gap alone does **not** prove an architectural impossibility.
+- Holdout-family standard deviations are descriptive only; they are not population-level confidence intervals over new generator mechanisms.
+- Rule replay uses `python-chess` plus schema checks; results need independent implementations and more realistic data before broad claims.
+
+## 7. Existing workflows and research references
+
+The legacy GPU/SmolLM2 and dataset/Snakemake workflows are preserved in the repository and are **separate** from the CPU-first v5 architecture comparison. The old `KAGGLE_ONE_CELL.py` and `scripts/run_all_kaggle.py` are not the v5 launcher. Do **not** merge their numerical outputs without a protocol reconciliation.
+
+Original architecture models and citations are documented in [`docs/ARCHITECTURE_PAPERS_AND_PROTOCOL.md`](docs/ARCHITECTURE_PAPERS_AND_PROTOCOL.md). The results are not reproduced numerical scores from those publications. Key sources include Elman (1990), Hochreiter and Schmidhuber (1997), Cho et al. (2014), Vaswani et al. (2017), Katharopoulos et al. (2020), and Gu et al. (2022).
+
+**Repository rule:** Commit code, not experimental claims. Release a result only after `pipeline_status.json` reports `complete: true`, both independent audit JSONs pass, and the dataset, model version, and exact run configuration are archived.
