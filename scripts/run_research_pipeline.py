@@ -22,6 +22,15 @@ PROFILES={
     'full':{'models':['elman_rnn','lstm','gru','causal_transformer','linear_attention','diagonal_ssm'],
             'folds':[0,1,2], 'seeds':[3101,3102,3103,3104,3105],
             'cutoffs':['0','4','8','16','full'],'epochs':50,'pairs':300,'target_parameters':150000},
+    'foundation_pilot':{'models':['elman_original','gru_original','causal_transformer_postnorm',
+                                  'linear_attention_multihead','s4d_lin'],
+            'folds':[0], 'seeds':[3101], 'cutoffs':['0','4','full'],
+            'epochs':2,'pairs':30,'target_parameters':150000},
+    'foundation_full':{'models':['elman_original','lstm','gru_original','causal_transformer_postnorm',
+                                 'linear_attention_multihead','s4d_lin'],
+            'folds':[0,1,2], 'seeds':[3101,3102,3103,3104,3105],
+            'cutoffs':['0','4','8','16','full'], 'epochs':50,
+            'pairs':300, 'target_parameters':150000},
 }
 
 def call(label,command,logdir):
@@ -123,7 +132,7 @@ def run_pipeline(argv=None):
             raise RuntimeError('Completion manifest failed verification')
         for p in ['independent_integrity_audit.json','comparison_integrity_audit.json']:
             if not json.loads((out/p).read_text())['passed']:raise RuntimeError(f'Incomplete integrity audit: {p}')
-        if args.profile=='full':
+        if args.profile in ('full','foundation_full'):
             step('08_manuscript_tables',[sys.executable,'scripts/make_manuscript_tables.py',out])
         status['complete']=True;status['neural_runs']=n
         print('ALL STAGES AND INDEPENDENT AUDITS COMPLETE:',n,'neural runs',flush=True)

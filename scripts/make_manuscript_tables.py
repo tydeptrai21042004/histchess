@@ -1,4 +1,4 @@
-"""Generate descriptive manuscript tables ONLY from fully audited completed v6 data.
+"""Generate descriptive manuscript tables from fully audited completed v6/v7 data.
 
 This is formatting, not inferential statistics.  Do not cite the generated tables
 as evidence of external validity or architectural impossibility.
@@ -27,6 +27,11 @@ def pretty(name):
             'causal_transformer':'Causal Transformer',
             'linear_attention':'Linear Attention',
             'diagonal_ssm':'Real Diagonal SSM',
+            'elman_original':'Elman original (1 layer)',
+            'gru_original':'Cho GRU (original equations)',
+            'causal_transformer_postnorm':'Causal Transformer (post-LN)',
+            'linear_attention_multihead':'Multihead linear attention',
+            's4d_lin':'S4D-Lin (ZOH)',
             'board_only':'Board-only null','move_bag':'Move bag + LR',
             'move_ngrams':'Move n-grams + LR'}.get(name,name)
 
@@ -42,8 +47,8 @@ def generate(root):
     for audit in ('independent_integrity_audit.json','comparison_integrity_audit.json'):
         require(json.loads((root/audit).read_text()).get('passed'),f'Audit failed: {audit}')
     config=json.loads((root/'architecture_config.json').read_text())
-    require(config.get('protocol_version')=='histchess-v6-publication-full-2026-10',
-            'Unexpected protocol version')
+    require(config.get('protocol_version') in ('histchess-v6-publication-full-2026-10',
+                'histchess-v7-foundation-variants-2026-11'),'Unexpected protocol version')
     require(len(ast['runs'])==len(config['models'])*len(config['folds'])*len(config['seeds'])*len(config['cutoffs']),
             'Missing neural configurations')
     require(len(ast['runs'])==450 and len(config['models'])==6 and len(config['folds'])==3
@@ -72,7 +77,8 @@ def generate(root):
     tbl={ (x['architecture'],x['history_plies'],x['task']):x for x in outrows}
     models=list(config['models'])
     histories=[str(x) for x in config['cutoffs']]
-    lines=['# HistChess v6 — measured manuscript tables','',
+    version='v7 foundation variants' if 'v7' in config['protocol_version'] else 'v6 legacy'
+    lines=[f'# HistChess {version} — measured manuscript tables','',
            '> Descriptive only. These are measured values, NOT independent-generator confidence intervals.',
            '> The data are synthetic and all learned models were trained from scratch.','',
            '## Neural architectures (all four tasks pooled)','',
@@ -114,7 +120,7 @@ def generate(root):
                              'Only three mechanisms per task',
                              'Repeated folds and random seeds are correlated',
                              'History-length cutoff reassessment is not train-short/test-long on new long histories',
-                             'No pretrained large language models, no full published S4D implementation',
+                             'No pretrained large language models; S4D-Lin is minimal ZOH, not S4D-LegS',
                              'Descriptive effects, not corrected confirmatory inference']}
     lines+=['','## Data and reporting restrictions','',
             f'- Counterfactual pairs: {len(pairs)}; history lengths (plies): min {min(lengths)}, median {statistics.median(lengths)}, max {max(lengths)}.',
@@ -122,6 +128,7 @@ def generate(root):
             '- Privileged replay oracle excluded from fair baseline table.',
             '- Length-cutoff reassessment reuses the same examples; it is not independent long-sequence generalization.',
             '- Mean ± SD values describe correlated fold-seed runs; not a confidence interval over new generator families.',
+            '- Inspect history_cutoff_coverage.csv for nominal cutoffs with identical observable histories.',
             '- Inspect learning curves and validation losses before asserting convergence.',
             '- Do not call this an external LLM benchmark.']
     (root/'manuscript_results.md').write_text('\n'.join(lines)+'\n',encoding='utf8')

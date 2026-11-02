@@ -29,6 +29,7 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.nn import functional as F
+from .foundation_models import OriginalGRU, MultiheadLinearAttentionBlock, S4DLinBlock
 
 TASKS = ("castling", "en_passant", "halfmove", "repetition")
 PIECES = "-PNBRQKpnbrqk"
@@ -46,6 +47,11 @@ ARCHITECTURES = {
     "causal_transformer": {"reference": "Vaswani et al. (2017), Attention Is All You Need", "doi": "10.48550/arXiv.1706.03762", "mechanism": "causal softmax self-attention; trained from scratch"},
     "linear_attention": {"reference": "Katharopoulos et al. (2020), Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention", "doi": "10.48550/arXiv.2006.16236", "mechanism": "causal feature-map linear attention (ELU+1)"},
     "diagonal_ssm": {"reference": "Gu, Gupta, Goel and Re (2022), On the Parameterization and Initialization of Diagonal State Space Models", "doi": "10.48550/arXiv.2206.11893", "mechanism": "real-valued diagonal recurrent linear state-space ablation; NOT full S4D"},
+    "elman_original": {"reference": "Elman (1990), Finding Structure in Time", "doi": "10.1207/s15516709cog1402_1", "mechanism": "single-layer tanh Elman recurrence with HistChess classification head"},
+    "gru_original": {"reference": "Cho et al. (2014), Learning Phrase Representations using RNN Encoder-Decoder", "doi": "10.3115/v1/D14-1179", "mechanism": "reset-before-hidden-matrix original-equation GRU"},
+    "causal_transformer_postnorm": {"reference": "Vaswani et al. (2017), Attention Is All You Need", "doi": "10.48550/arXiv.1706.03762", "mechanism": "post-normalization multihead softmax attention; causal HistChess adaptation"},
+    "linear_attention_multihead": {"reference": "Katharopoulos et al. (2020), Transformers are RNNs", "doi": "10.48550/arXiv.2006.16236", "mechanism": "four-head causal ELU+1 linear attention, parallel/recurrent equivalent"},
+    "s4d_lin": {"reference": "Gu et al. (2022), On the Parameterization and Initialization of Diagonal State Space Models", "doi": "10.48550/arXiv.2206.11893", "mechanism": "minimal complex S4D-Lin with ZOH diagonal convolution kernel, adapted residual classifier; not S4D-LegS"},
 }
 
 
@@ -209,16 +215,27 @@ class HistoryArchitecture(nn.Module):
         else:
             self.register_buffer("position_values",sinusoidal_positions(max_history+1,width),persistent=False)
         self.norm_input=nn.LayerNorm(width)
-        if kind in ("elman_rnn","gru","lstm"):
-            module={"elman_rnn":nn.RNN,"gru":nn.GRU,"lstm":nn.LSTM}[kind]
-            self.sequence=module(width,width,num_layers=2,batch_first=True,dropout=dropout,
-                                 nonlinearity="tanh" if kind=="elman_rnn" else None) if kind=="elman_rnn" else module(width,width,num_layers=2,batch_first=True,dropout=dropout)
-        elif kind=="causal_transformer":
+        if kind in ("elman_rnn","elman_original","gru","lstm"):
+            if kind.startswith("elman"):
+                num_layers = 1 if kind=="elman_original" else 2
+                self.sequence=nn.RNN(width,width,num_layers=num_layers,batch_first=True,
+                                     dropout=dropout if num_layers>1 else 0.0,nonlinearity="tanh")
+            else:
+                self.sequence={"gru":nn.GRU,"lstm":nn.LSTM}[kind](
+                    width,width,num_layers=2,batch_first=True,dropout=dropout)
+        elif kind=="gru_original":
+            self.sequence=OriginalGRU(width,num_layers=2,dropout=dropout)
+        elif kind in ("causal_transformer","causal_transformer_postnorm"):
             layer=nn.TransformerEncoderLayer(d_model=width,nhead=4,dim_feedforward=2*width,
-                                             dropout=dropout,batch_first=True,activation="gelu",norm_first=True)
+                dropout=dropout,batch_first=True,activation="gelu",
+                norm_first=(kind=="causal_transformer"))
             self.sequence=nn.TransformerEncoder(layer,num_layers=2,enable_nested_tensor=False)
         elif kind=="linear_attention":
             self.sequence=nn.ModuleList([CausalLinearBlock(width,dropout) for _ in range(2)])
+        elif kind=="linear_attention_multihead":
+            self.sequence=nn.ModuleList([MultiheadLinearAttentionBlock(width,4,dropout) for _ in range(2)])
+        elif kind=="s4d_lin":
+            self.sequence=nn.ModuleList([S4DLinBlock(width,dropout) for _ in range(2)])
         else:
             self.sequence=nn.ModuleList([RealDiagonalSSMBlock(width,dropout) for _ in range(2)])
         self.head=nn.Sequential(nn.Linear(96+8+16+width,128),nn.ReLU(),nn.Dropout(dropout),nn.Linear(128,1))
@@ -233,7 +250,9 @@ class HistoryArchitecture(nn.Module):
                    else self.position_values[:t].unsqueeze(0))
         x=self.norm_input(x+positions)
         valid=torch.arange(t,device=moves.device)[None,:]<lengths.clamp(min=1)[:,None]
-        if self.kind in ("elman_rnn","gru","lstm"):
+        if self.kind=="gru_original":
+            state=self.sequence(x,lengths)
+        elif self.kind in ("elman_rnn","elman_original","gru","lstm"):
             packed=nn.utils.rnn.pack_padded_sequence(x,lengths.clamp(min=1).cpu(),
                                                        batch_first=True,enforce_sorted=False)
             result=self.sequence(packed)
@@ -241,7 +260,7 @@ class HistoryArchitecture(nn.Module):
             state=h[-1]
         else:
             x=x*valid.unsqueeze(-1)
-            if self.kind=="causal_transformer":
+            if self.kind in ("causal_transformer","causal_transformer_postnorm"):
                 causal=torch.triu(torch.ones((t,t),device=moves.device,dtype=torch.bool),diagonal=1)
                 x=self.sequence(x,mask=causal,src_key_padding_mask=~valid)
             else:
@@ -253,6 +272,20 @@ class HistoryArchitecture(nn.Module):
 
 
 def num_parameters(model):return sum(x.numel() for x in model.parameters())
+
+
+def make_adamw_groups(model,weight_decay):
+    """Honor S4D state parameter zero-decay while keeping other optimizers fixed.
+
+    This is consistent with the minimal S4D reference's per-parameter optimizer
+    hint, and leaves all legacy model parameter groups unchanged.
+    """
+    by_decay={}
+    for param in model.parameters():
+        options=getattr(param,"_optim",{})
+        decay=float(options.get("weight_decay",weight_decay))
+        by_decay.setdefault(decay,[]).append(param)
+    return [{"params":params,"weight_decay":decay} for decay,params in by_decay.items()]
 
 
 def make_budgeted_model(kind,target=150000,max_history=256,dropout=0.10,
@@ -320,6 +353,42 @@ def _check_pair_integrity(pairs):
         if old!=p["pair_id"]:raise ValueError("Duplicate boards across pairs")
 
 
+def cutoff_coverage(pairs, folds=(0,1,2), cutoffs=(0,4,8,16,None), max_history=256):
+    """Count unique test observations under each cutoff and find duplicate views.
+
+    This is a dataset-level diagnostic, NOT accuracy, and detects misleading
+    nominal length-shift experiments where different cutoffs see the same moves.
+    """
+    records=[]
+    for fold in folds:
+        test=[p for p in rotate_splits(pairs,fold) if p["split"]=="test"]
+        for task in ("all",)+TASKS:
+            selected=[p for p in test if task=="all" or p["task"]==task]
+            previous={}
+            for cutoff in cutoffs:
+                signatures=[];actual=[]
+                for pair in selected:
+                    for variant in ("positive","negative"):
+                        seq=pair[variant]["history_uci"][-max_history:]
+                        if cutoff is not None:
+                            seq=seq[-cutoff:] if cutoff else []
+                        signatures.append((pair["task"],pair["board_key"],tuple(seq)))
+                        actual.append(len(seq))
+                # Keep the records in fixed pair order, not just unique signatures.
+                observation_key=tuple(signatures)
+                alias=previous.get(observation_key)
+                label="full" if cutoff is None else str(cutoff)
+                records.append({"fold":fold,"task":task,"history_plies":label,
+                    "records":len(actual),"min_visible_plies":min(actual),
+                    "max_visible_plies":max(actual),
+                    "mean_visible_plies":sum(actual)/len(actual),
+                    "unique_observed_signatures":len(set(signatures)),
+                    "identical_to_cutoff":"" if alias is None else alias,
+                    "genuinely_distinct_view":int(alias is None)})
+                previous.setdefault(observation_key,label)
+    return records
+
+
 def observability_bounds(pairs, folds=(0,1,2), cutoffs=(0,4,8,16,None), max_history=256):
     """Information-theoretic bounds induced by identical board+visible suffix.
 
@@ -385,7 +454,7 @@ def _one_run(pairs,kind,fold,cutoff,seed,options,output):
     model=make_budgeted_model(kind,options.target_parameters,options.max_history,
                               options.dropout,position_encoding=options.position_encoding).to(device)
     params=num_parameters(model)
-    optim=torch.optim.AdamW(model.parameters(),lr=options.lr,weight_decay=options.weight_decay)
+    optim=torch.optim.AdamW(make_adamw_groups(model,options.weight_decay),lr=options.lr)
     loss_fn=nn.BCEWithLogitsLoss()
     best=float("inf");state=None;best_epoch=0;bad=0;curves=[]
     training_start=time.monotonic()
@@ -579,19 +648,23 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
     longest=max(len(p[v]["history_uci"]) for p in pairs for v in ("positive","negative"))
     if longest>max_history:raise ValueError(f"max_history={max_history} truncates history length {longest}")
     if any(c is not None and c>max_history for c in cutoffs):raise ValueError("Cutoff above max_history")
+    legacy_names={"elman_rnn","lstm","gru","causal_transformer","linear_attention","diagonal_ssm"}
+    protocol=("histchess-v6-publication-full-2026-10" if set(architectures)<=legacy_names
+              else "histchess-v7-foundation-variants-2026-11")
     config={"models":{m: ARCHITECTURES[m] for m in architectures},"folds":list(folds),
             "seeds":list(seeds),"cutoffs":["full" if c is None else c for c in cutoffs],
             "history_max_in_dataset":longest,"max_history":max_history,
             "train_protocol":vars(options),"source":"synthetic diversified generator families",
-            "protocol_version":"histchess-v6-publication-full-2026-10",
+            "protocol_version":protocol,
             "move_encoding":"UCI from/to squares and promotion type (no unknown move vocabulary)",
             "notes":["No pretrained LLM tested. These models are trained from scratch.",
                      "This is a controlled architecture-family study, not exact replication of published experiments.",
-                     "Diagonal SSM is a simplified real diagonal recurrence, not a faithful S4D reproduction.",
+                     "Legacy diagonal_ssm is real-only; s4d_lin uses minimal ZOH S4D-Lin, NOT S4D-LegS.",
                      "Only three generator families per task; add independent mechanisms for external validity."]}
     # Persist an individual, content-bound shard immediately after each training
     # run. Kaggle notebook interruptions can be resumed without fabricating output.
-    source_files=[Path(__file__),Path(__file__).with_name("core.py"),
+    source_files=[Path(__file__),Path(__file__).with_name("foundation_models.py"),
+                  Path(__file__).with_name("core.py"),
                   Path(__file__).with_name("diverse.py"),Path(__file__).with_name("length_stress.py")]
     fingerprints={"model_config":config,
                   "source_sha256":{f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in source_files},
@@ -608,6 +681,9 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
     (out/"architecture_config.json").write_text(json.dumps(config,indent=2),encoding="utf8")
     _write_csv(out/"observability_bounds.csv",
                observability_bounds(pairs,folds,cutoffs,max_history))
+    # Explicitly reveal cutoff aliases (e.g., 32/64/full on <=24-ply data).
+    _write_csv(out/"history_cutoff_coverage.csv",cutoff_coverage(
+        pairs,folds,tuple(dict.fromkeys((*cutoffs,*length_eval_cutoffs))),max_history))
     all_metrics=[];all_predictions=[];all_curves=[];all_ood_metrics=[];all_ood_predictions=[];completed=[]
     newly_trained=0
     clock_start=time.monotonic()
