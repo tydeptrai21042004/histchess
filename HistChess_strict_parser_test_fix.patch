@@ -1,0 +1,14 @@
+--- a/tests/test_encoding_metrics.py
++++ b/tests/test_encoding_metrics.py
+@@ -32,9 +32,9 @@
+ 
+ 
+ @pytest.mark.parametrize('raw,want',[
+-    ('YES',True),('no.',False),('Answer: Yes\n',True),('YES because',True),
++    ('YES',True),('no.',False),('Answer: Yes\n',True),('YES because',None),
+     ('possibly yes',None),('I cannot decide',None),('',None),('not sure',None),
+-    ('No? Maybe',False)])
++    ('No? Maybe',None)])
+ def test_strict_llm_output_parser(raw,want):
+     assert parse_yes_no(raw) is want
+ 

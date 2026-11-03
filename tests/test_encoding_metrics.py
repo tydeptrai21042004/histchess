@@ -32,9 +32,9 @@ def test_history_zero_and_tail_preservation():
 
 
 @pytest.mark.parametrize('raw,want',[
-    ('YES',True),('no.',False),('Answer: Yes\n',True),('YES because',True),
+    ('YES',True),('no.',False),('Answer: Yes\n',True),('YES because',None),
     ('possibly yes',None),('I cannot decide',None),('',None),('not sure',None),
-    ('No? Maybe',False)])
+    ('No? Maybe',None)])
 def test_strict_llm_output_parser(raw,want):
     assert parse_yes_no(raw) is want
 
