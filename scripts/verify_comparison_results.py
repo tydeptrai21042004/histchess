@@ -31,11 +31,13 @@ def audit(outdir):
     pmap={p['pair_id']:p for p in pairs}
     check(len(pmap)==len(pairs),'duplicate pair IDs')
     check(status.get('complete') is True,'comparison stage incomplete')
-    from histchess.architecture_benchmark import FAMILIES
     expected={}
+    stage={'train':0,'validation':1,'test':2}
     for fold in config['folds']:
         for pid,p in pmap.items():
-            idx=FAMILIES[p['task']].index(p['generator_family'])
+            if p.get('split') not in stage:
+                check(False,f'Unknown baseline split: {pid}');continue
+            idx=stage[p['split']]
             if ('train','validation','test')[(idx-int(fold))%3]=='test':
                 expected.setdefault(int(fold),set()).add(pid)
     group=collections.defaultdict(dict)

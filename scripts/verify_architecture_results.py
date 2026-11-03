@@ -83,30 +83,25 @@ def audit(outdir):
         if key in reported:problems.append(f"Duplicate metric group: {key}")
         reported[key]=m
     check(len(reported)==5*len(expected),"Expected 5 per-task/overall metric rows per run")
-    # A dataset may be v3 (three families per task) or a future expanded
-    # version. Reconstruct the original three-family fold rotation from the
-    # generator family order, which is included in generated pair order.
-    ordered=collections.defaultdict(lambda:[None,None,None])
+    # Reconstruct folded test groups from the UNROTATED source split. This
+    # supports both the original three source families and multiple distinct
+    # families per split without assuming that seeds are independent sources.
     stage={"train":0,"validation":1,"test":2}
+    baseline_family_split={}
     for p in pairs:
         if p.get("split") not in stage:
-            problems.append(f"Cannot reconstruct generator-family order for {p['pair_id']}")
+            problems.append(f"Unrecognized source split for {p['pair_id']}")
             continue
-        ix=stage[p["split"]]
-        old=ordered[p["task"]][ix]
-        if old not in (None,p["generator_family"]):
-            problems.append(f"Inconsistent baseline split/family for {p['task']}")
-        ordered[p["task"]][ix]=p["generator_family"]
-    for task,fams in ordered.items():
-        check(len(set(fams))==3 and None not in fams,
-              f"Expected three source generator families for {task}; got {fams}")
+        source_family=(p["task"],p.get("independent_mechanism",p["generator_family"]))
+        old=baseline_family_split.setdefault(source_family,p["split"])
+        check(old==p["split"],f"Source family crosses baseline splits: {source_family}")
     for key in expected:
         model,fold,seed,history=key
         data=pred_groups.get(key,{})
         test_ids=set()
         for p in pairs:
-            if len(ordered[p["task"]])!=3:continue
-            ix=ordered[p["task"]].index(p["generator_family"])
+            if p.get("split") not in stage:continue
+            ix=stage[p["split"]]
             if (ix-fold)%3==2:test_ids.add(p["pair_id"])
         expected_records={(pid,variant) for pid in test_ids for variant in ("positive","negative")}
         if set(data)!=expected_records:

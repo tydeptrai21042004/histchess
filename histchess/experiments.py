@@ -244,7 +244,9 @@ def sequence_experiment(pairs, outdir, epochs=3, batch_size=32, seed=3101):
 def parse_yes_no(output):
     # A model that generates ambiguous text is counted as invalid, NOT corrected.
     s = output.strip().lower()
-    m = re.match(r"^(?:answer\s*:\s*)?(yes|no)\b",s)
+    # Strict single-token answer. Do not treat long explanations, mixed answers,
+    # or output like "YES ... actually NO" as an unambiguous binary prediction.
+    m = re.fullmatch(r"(?:answer\s*:\s*)?(yes|no)[.!]?",s)
     return None if not m else (m.group(1)=="yes")
 
 
@@ -294,6 +296,7 @@ def llm_experiment(pairs, outdir, models, pairs_per_task=20, seed=3101,
                       f"Chronological UCI moves: {' '.join(item['history_uci'])}\nAnswer:")
             requests.append((p,variant,question))
     all_metrics, all_records=[] , []
+    model_metadata=[]
     for name in models:
         print(f"GPU LLM loading: {name}",flush=True)
         tokenizer=AutoTokenizer.from_pretrained(name,trust_remote_code=False)
@@ -302,6 +305,12 @@ def llm_experiment(pairs, outdir, models, pairs_per_task=20, seed=3101,
             tokenizer.pad_token=tokenizer.eos_token
         model=AutoModelForCausalLM.from_pretrained(name,torch_dtype=dtype,trust_remote_code=False).to(device)
         model.eval()
+        model_metadata.append({"model":name,
+            "model_revision":getattr(model.config,"_commit_hash",None),
+            "tokenizer_revision":getattr(tokenizer,"_commit_hash",None),
+            "model_class":type(model).__name__,
+            "prompting":"zero_shot_deterministic_yes_no",
+            "max_new_tokens":max_new_tokens})
         pred={}
         try:
             for offset in range(0,len(requests),batch_size):
@@ -328,6 +337,7 @@ def llm_experiment(pairs, outdir, models, pairs_per_task=20, seed=3101,
                     parsed=parse_yes_no(raw)
                     pred[(p["pair_id"],variant)]=parsed
                     all_records.append({"model":name,"pair_id":p["pair_id"],"task":p["task"],
+
                                         "variant":variant,"label":p[variant]["label"],
                                         "prediction":"" if parsed is None else int(parsed),
                                         "valid":parsed is not None,"raw_response":raw.strip()})
@@ -342,4 +352,5 @@ def llm_experiment(pairs, outdir, models, pairs_per_task=20, seed=3101,
             if device.type == "cuda": torch.cuda.empty_cache()
     write_csv(Path(outdir) / "llm_predictions.csv",all_records)
     write_csv(Path(outdir) / "llm_metrics.csv",all_metrics)
+    save_json(Path(outdir) / "pretrained_model_revisions.json",model_metadata)
     return all_metrics

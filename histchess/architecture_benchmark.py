@@ -91,21 +91,46 @@ def rows_from_pairs(pairs):
     return rows
 
 
+def _family_for_pair(p):
+    """A three-way source-stratified mechanism group, or explicit scenario group.
+
+    V8 group names are documented as related scenario variants, not nine
+    statistically independent mechanism inventions. This fold rotation remains
+    group-disjoint (including across generator replications).
+    """
+    base = FAMILIES[p["task"]]
+    family = p["generator_family"]
+    if "mechanism_fold_group" in p:
+        if p.get("independent_mechanism") is None or p.get("source_provenance") is None:
+            raise ValueError('External family group requires independent mechanism and source provenance')
+        ix=p["mechanism_fold_group"]
+        if type(ix) is not int or ix not in (0,1,2):
+            raise ValueError('External mechanism fold group must be 0, 1, or 2')
+        return ix
+    if family in base:
+        return base.index(family)
+    from .research_extension import SCENARIO_FAMILIES
+    if family not in SCENARIO_FAMILIES[p["task"]]:
+        raise ValueError(f"Unsupported task / generator family: {p['task']} / {family}")
+    return SCENARIO_FAMILIES[p["task"]].index(family) // 5
+
+
 def rotate_splits(pairs, fold):
-    """Rotate whole template mechanisms. All three test mechanisms per task get evaluated."""
+    """Rotate disjoint task/family groups; preserve original v6/v7 behavior."""
     if fold not in (0,1,2): raise ValueError("fold in {0,1,2} required")
     updated = []
     for pair in pairs:
         q = dict(pair)
-        idx = FAMILIES[q["task"]].index(q["generator_family"])
+        idx = _family_for_pair(q)
         q["split"] = ("train","validation","test")[(idx-fold)%3]
         updated.append(q)
     for task in TASKS:
         groups = {split: {p["generator_family"] for p in updated
                            if p["task"]==task and p["split"]==split}
                   for split in ("train","validation","test")}
-        if any(len(s)!=1 for s in groups.values()) or len(set.union(*groups.values()))!=3:
-            raise ValueError(f"Invalid held-out family allocation for {task}")
+        if (any(not s for s in groups.values()) or
+                len(set.union(*groups.values())) != sum(len(s) for s in groups.values())):
+            raise ValueError(f"Invalid or overlapping held-out family allocation for {task}")
     return updated
 
 
@@ -341,8 +366,9 @@ def _check_pair_integrity(pairs):
     keys=collections.Counter(p["pair_id"] for p in pairs)
     if not pairs or any(n!=1 for n in keys.values()):raise ValueError("Duplicate/empty pair ID set")
     for p in pairs:
-        if p["task"] not in TASKS or p.get("generator_family") not in FAMILIES[p["task"]]:
-            raise ValueError("Unsupported task/generator family")
+        if p["task"] not in TASKS:
+            raise ValueError("Unsupported task")
+        _family_for_pair(p)
         if p["positive"]["label"]!=1 or p["negative"]["label"]!=0:
             raise ValueError("Incorrect balanced counterfactual labels")
         if p["positive"]["board_observation"]!=p["negative"]["board_observation"] or p["positive"]["board_observation"]!=p["board_key"]:
@@ -451,38 +477,60 @@ def _one_run(pairs,kind,fold,cutoff,seed,options,output):
             signatures.setdefault(row["pair_id"],signature)
             if signatures[row["pair_id"]]!=signature:
                 raise RuntimeError("Zero-history pair has unequal visible input")
-    model=make_budgeted_model(kind,options.target_parameters,options.max_history,
-                              options.dropout,position_encoding=options.position_encoding).to(device)
-    params=num_parameters(model)
-    optim=torch.optim.AdamW(make_adamw_groups(model,options.weight_decay),lr=options.lr)
+    # Inner validation controls hyperparameter selection. The TEST partition is
+    # not inspected until all candidates are fitted and the winning trial chosen.
     loss_fn=nn.BCEWithLogitsLoss()
-    best=float("inf");state=None;best_epoch=0;bad=0;curves=[]
-    training_start=time.monotonic()
-    for epoch in range(1,options.epochs+1):
-        model.train();n=0;total=0.0
-        perm=torch.randperm(len(sets["train"]),device=device)
-        for ids in perm.split(options.batch_size):
-            optim.zero_grad(set_to_none=True)
-            logits=model(*(v[ids] for v in tensors["train"][:5]))
-            loss=loss_fn(logits,tensors["train"][5][ids]);loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(),1.0)
-            optim.step();n+=ids.numel();total+=float(loss.detach())*ids.numel()
-        model.eval();vloss=0.0
-        with torch.inference_mode():
-            for ids in torch.arange(len(sets["validation"]),device=device).split(options.batch_size):
-                logits=model(*(v[ids] for v in tensors["validation"][:5]))
-                vloss+=float(loss_fn(logits,tensors["validation"][5][ids]))*len(ids)
-        vloss/=len(sets["validation"])
-        curves.append({"architecture":kind,"fold":fold,"seed":seed,"history":str(cutoff),
-                       "epoch":epoch,"train_loss":total/n,"validation_loss":vloss})
-        if vloss<best-1e-4:
-            best=vloss;state={k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
-            best_epoch=epoch;bad=0
-        else:
-            bad+=1
-            if bad>=options.patience: break
-    train_seconds=time.monotonic()-training_start
+    grid=getattr(options,"optimizer_grid",None) or ((options.lr,options.weight_decay,options.dropout),)
+    best=float("inf");best_epoch=0;best_hparams=None;state=None;selected_width=None
+    curves=[];train_seconds=0.0;params=0;selected_trial=-1
+    for trial,(lr,weight_decay,dropout) in enumerate(grid):
+        torch.manual_seed(seed)
+        random.seed(seed)
+        if torch.cuda.is_available():torch.cuda.manual_seed_all(seed)
+        model=make_budgeted_model(kind,options.target_parameters,options.max_history,
+                                  dropout,position_encoding=options.position_encoding).to(device)
+        candidate_params=num_parameters(model)
+        optim=torch.optim.AdamW(make_adamw_groups(model,weight_decay),lr=lr)
+        trial_best=float("inf");trial_state=None;trial_epoch=0;bad=0
+        tick=time.monotonic()
+        for epoch in range(1,options.epochs+1):
+            model.train();n=0;total=0.0
+            perm=torch.randperm(len(sets["train"]),device=device)
+            for ids in perm.split(options.batch_size):
+                optim.zero_grad(set_to_none=True)
+                logits=model(*(v[ids] for v in tensors["train"][:5]))
+                loss=loss_fn(logits,tensors["train"][5][ids]);loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(),1.0)
+                optim.step();n+=ids.numel();total+=float(loss.detach())*ids.numel()
+            model.eval();vloss=0.0
+            with torch.inference_mode():
+                for ids in torch.arange(len(sets["validation"]),device=device).split(options.batch_size):
+                    logits=model(*(v[ids] for v in tensors["validation"][:5]))
+                    vloss+=float(loss_fn(logits,tensors["validation"][5][ids]))*len(ids)
+            vloss/=len(sets["validation"])
+            curves.append({"architecture":kind,"fold":fold,"seed":seed,"history":str(cutoff),
+                           "epoch":epoch,"train_loss":total/n,"validation_loss":vloss,
+                           "grid_trial":trial,"trial_lr":lr,"trial_weight_decay":weight_decay,
+                           "trial_dropout":dropout})
+            if vloss<trial_best-1e-4:
+                trial_best=vloss
+                trial_state={k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
+                trial_epoch=epoch;bad=0
+            else:
+                bad+=1
+                if bad>=options.patience:break
+        train_seconds+=time.monotonic()-tick
+        if trial_state is None:raise RuntimeError('No valid training checkpoint')
+        if trial_best<best:
+            best=trial_best;state=trial_state;best_epoch=trial_epoch
+            best_hparams=(lr,weight_decay,dropout);selected_trial=trial
+            selected_width=getattr(model,'width',None);params=candidate_params
+        del model,optim
     if state is None:raise RuntimeError("Failed to establish a checkpoint")
+    # Recreate the winning model with identical capacity and return only its
+    # held-out TEST results. Never tune against test accuracy.
+    model=make_budgeted_model(kind,options.target_parameters,options.max_history,
+                              best_hparams[2],position_encoding=options.position_encoding).to(device)
     model.load_state_dict(state);model.eval()
     probabilities=[]
     start=time.monotonic()
@@ -497,7 +545,9 @@ def _one_run(pairs,kind,fold,cutoff,seed,options,output):
                     "history_plies":"full" if cutoff is None else str(cutoff),
                     "parameters":params,"target_parameters":options.target_parameters,
                     "best_epoch":best_epoch,"best_validation_bce":best,
-                    "train_seconds":train_seconds,"test_seconds":inference_seconds,**row})
+                    "selected_lr":best_hparams[0],"selected_weight_decay":best_hparams[1],
+                    "selected_dropout":best_hparams[2],"selected_grid_trial":selected_trial,
+                    "grid_trial_count":len(grid),"train_seconds":train_seconds,"test_seconds":inference_seconds,**row})
     for row,p,score in zip(sets["test"],preds,probabilities):
         pre.append({"architecture":kind,"fold":fold,"seed":seed,
                     "history_plies":"full" if cutoff is None else str(cutoff),
@@ -571,8 +621,13 @@ def _write_architecture_analysis(out, metrics, predictions, seed=3101):
     comparisons=[]
     for (fold,trial,history),d in sorted(indexed.items()):
         present={key[0] for key in d}
-        for reference in ("gru","causal_transformer"):
-            if reference not in present:continue
+        references = (("gru", "gru_original"),
+                      ("causal_transformer", "causal_transformer_postnorm"))
+        if not any(set(group)&present for group in references) and len(present)>1:
+            references = ((sorted(present)[0],),)
+        for equivalent_names in references:
+            reference = next((r for r in equivalent_names if r in present), None)
+            if reference is None:continue
             for tested in sorted(present-{reference}):
                 ids={key[1] for key in d if key[0]==reference}
                 paired=[]
@@ -600,10 +655,12 @@ def _write_architecture_analysis(out, metrics, predictions, seed=3101):
                     "paired_bootstrap_high_95_descriptive":boots[int(.975*(len(boots)-1))],
                     "multiplicity_adjusted":False,
                     "interpretation":"Pair-bootstrap within ONE held-out generator family per task; not independent-family inference."})
+    if len({p["architecture"] for p in predictions}) > 1 and not comparisons:
+        raise RuntimeError("No neural matched comparisons were generated; verify reference names")
     _write_csv(Path(out)/"architecture_matched_comparisons.csv",comparisons)
     # Avoid accidental claims of full-history and long-history independence.
     (Path(out)/"analysis_limitations.txt").write_text(
-        "Dataset is synthetic with only 3 generator families per task; rotations reuse the same pairs.\n"
+        "Dataset uses synthetic generator scenarios; read data/pairs.jsonl to count underlying independent mechanisms. Fold rotations reuse the same pairs.\n"
         "Do not treat fold-seed rows as independent samples.\n"
         "No proof of a general Transformer or LLM impossibility follows from these measured scores.\n"
         "None of these models are pretrained LLMs; the causal Transformer is trained from scratch.\n"
@@ -617,7 +674,8 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
                                 max_history=256,target_parameters=150000,
                                 lr=0.001,weight_decay=0.001,device="cpu",
                                 dropout=0.10,position_encoding="learned",length_eval_cutoffs=(),
-                                length_eval_train_cutoffs=(),max_new_runs=0,max_session_seconds=0):
+                                length_eval_train_cutoffs=(),max_new_runs=0,max_session_seconds=0,
+                                grid_lrs=(),grid_weight_decays=(),grid_dropouts=()):
     """Runs architecture x fold x seed x history, saving partial progress on each run.
 
     No results are claimed until each stage completes. This routine never invokes
@@ -639,11 +697,19 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
         raise ValueError("Length-evaluation source cutoff must be one of the trained cutoffs")
     if len(set(folds))!=len(folds) or len(set(seeds))!=len(seeds) or len(set(cutoffs))!=len(cutoffs):raise ValueError("Repeated fold, seed or cutoff")
     torch.set_num_threads(min(4,os.cpu_count() or 1))
+    import itertools
+    lrs=tuple(grid_lrs) if grid_lrs else (lr,)
+    decays=tuple(grid_weight_decays) if grid_weight_decays else (weight_decay,)
+    drops=tuple(grid_dropouts) if grid_dropouts else (dropout,)
+    if any(x<=0 for x in lrs) or any(x<0 for x in decays) or any(not 0<=x<1 for x in drops):
+        raise ValueError('Invalid hyperparameter grid entries')
+    grid=tuple(itertools.product(lrs,decays,drops))
+    if len(grid)>36:raise ValueError('Too many hyperparameter trials; maximum 36')
     options=argparse.Namespace(epochs=epochs,patience=patience,batch_size=batch_size,
         max_history=max_history,target_parameters=target_parameters,lr=lr,
         weight_decay=weight_decay,device=device,dropout=dropout,
         position_encoding=position_encoding,length_eval_cutoffs=tuple(length_eval_cutoffs),
-        length_eval_train_cutoffs=tuple(length_eval_train_cutoffs))
+        length_eval_train_cutoffs=tuple(length_eval_train_cutoffs),optimizer_grid=grid)
     # Explicitly fail if full histories will silently be truncated.
     longest=max(len(p[v]["history_uci"]) for p in pairs for v in ("positive","negative"))
     if longest>max_history:raise ValueError(f"max_history={max_history} truncates history length {longest}")
@@ -651,7 +717,12 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
     legacy_names={"elman_rnn","lstm","gru","causal_transformer","linear_attention","diagonal_ssm"}
     protocol=("histchess-v6-publication-full-2026-10" if set(architectures)<=legacy_names
               else "histchess-v7-foundation-variants-2026-11")
+    underlying_counts={t:len({p.get('independent_mechanism',p['generator_family'])
+                              for p in pairs if p['task']==t}) for t in TASKS}
+    scenario_counts={t:len({p['generator_family'] for p in pairs if p['task']==t}) for t in TASKS}
     config={"models":{m: ARCHITECTURES[m] for m in architectures},"folds":list(folds),
+            "independent_mechanism_counts":underlying_counts,
+            "scenario_family_counts":scenario_counts,
             "seeds":list(seeds),"cutoffs":["full" if c is None else c for c in cutoffs],
             "history_max_in_dataset":longest,"max_history":max_history,
             "train_protocol":vars(options),"source":"synthetic diversified generator families",
@@ -660,7 +731,7 @@ def run_architecture_benchmark(pairs,outdir,*, architectures=None,folds=(0,1,2),
             "notes":["No pretrained LLM tested. These models are trained from scratch.",
                      "This is a controlled architecture-family study, not exact replication of published experiments.",
                      "Legacy diagonal_ssm is real-only; s4d_lin uses minimal ZOH S4D-Lin, NOT S4D-LegS.",
-                     "Only three generator families per task; add independent mechanisms for external validity."]}
+                     "Scenario groups are not necessarily independent source mechanisms; see independent_mechanism_counts."]}
     # Persist an individual, content-bound shard immediately after each training
     # run. Kaggle notebook interruptions can be resumed without fabricating output.
     source_files=[Path(__file__),Path(__file__).with_name("foundation_models.py"),
@@ -778,6 +849,12 @@ def main():
     ap.add_argument("--lr",type=float,default=0.001)
     ap.add_argument("--weight-decay",type=float,default=0.001)
     ap.add_argument("--dropout",type=float,default=0.10)
+    ap.add_argument("--grid-lrs",type=float,nargs="*",default=[],
+                    help="Validation-only search over learning rates; default single 0.001")
+    ap.add_argument("--grid-weight-decays",type=float,nargs="*",default=[],
+                    help="Validation-only search over AdamW decays")
+    ap.add_argument("--grid-dropouts",type=float,nargs="*",default=[],
+                    help="Validation-only search over dropout rates")
     ap.add_argument("--position-encoding",choices=("learned","sinusoidal"),default="learned")
     ap.add_argument("--length-eval-cutoffs",nargs="*",default=[],
                     help="Test a trained checkpoint at other history cutoffs; use sinusoidal positions")
@@ -832,7 +909,9 @@ def main():
         position_encoding=args.position_encoding,
         length_eval_cutoffs=tuple(None if x=="full" else int(x) for x in args.length_eval_cutoffs),
         length_eval_train_cutoffs=tuple(None if x=="full" else int(x) for x in args.length_eval_train_cutoffs),
-        max_new_runs=args.max_new_runs,max_session_seconds=args.max_session_seconds)
+        max_new_runs=args.max_new_runs,max_session_seconds=args.max_session_seconds,
+        grid_lrs=tuple(args.grid_lrs),grid_weight_decays=tuple(args.grid_weight_decays),
+        grid_dropouts=tuple(args.grid_dropouts))
 
 
 if __name__=="__main__":main()
