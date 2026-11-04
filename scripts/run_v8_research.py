@@ -151,7 +151,33 @@ def run(args):
             if args.run_llm:
                 llmdir=folder/'pretrained_llm'
                 metric_file=llmdir/'llm_metrics.csv'
-                if not metric_file.exists():
+                # An interrupted inference may leave only some output files.
+                # Resume by recomputing that replica, never by trusting a lone metrics file.
+                def llm_artifacts_complete():
+                    revisions=llmdir/'pretrained_model_revisions.json'
+                    predictions=llmdir/'llm_predictions.csv'
+                    if not all(f.is_file() for f in (metric_file,revisions,predictions)):
+                        return False
+                    try:
+                        versions=json.loads(revisions.read_text())
+                        with metric_file.open(newline='') as f:
+                            metrics=list(csv.DictReader(f))
+                        with predictions.open(newline='') as f:
+                            rows=list(csv.DictReader(f))
+                    except (OSError,ValueError,KeyError):
+                        return False
+                    if [x.get('model') for x in versions]!=args.llm_models:
+                        raise RuntimeError('Existing LLM outputs have different model IDs; '
+                                           'do not mix incompatible evaluations')
+                    return (len(metrics)==5*len(args.llm_models) and
+                            len(rows)==2*4*args.llm_pairs_per_task*len(args.llm_models))
+
+                if not llm_artifacts_complete():
+                    # The model outputs are written at the end of inference.
+                    # Delete any incomplete output set before recomputing it.
+                    for fname in ('llm_predictions.csv','llm_metrics.csv',
+                                  'pretrained_model_revisions.json'):
+                        (llmdir/fname).unlink(missing_ok=True)
                     from histchess.experiments import llm_experiment
                     fold_zero=rotate_splits(pairs,0)
                     llm_experiment(fold_zero,llmdir,args.llm_models,
@@ -159,6 +185,8 @@ def run(args):
                                    seed=args.generator_seed+rep*100003,
                                    batch_size=args.llm_batch_size,
                                    require_gpu=not args.allow_cpu_llm)
+                if not llm_artifacts_complete():
+                    raise RuntimeError('Pretrained LLM outputs remain incomplete')
                 revisions=llmdir/'pretrained_model_revisions.json'
                 if not metric_file.is_file() or not metric_file.stat().st_size or not revisions.is_file():
                     raise RuntimeError('Incomplete LLM predictions/metrics/model provenance')
